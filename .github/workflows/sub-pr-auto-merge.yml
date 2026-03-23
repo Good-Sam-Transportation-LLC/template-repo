@@ -1,0 +1,174 @@
+name: "Sub-PR Auto-Merge"
+
+on:
+  pull_request:
+    types: [opened, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  auto-merge-sub-pr:
+    name: Auto-merge Sub-PR
+    if: github.event.pull_request.base.ref != github.event.repository.default_branch && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.user.type == 'Bot'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: sub-pr-automerge-${{ github.event.pull_request.number }}
+      # Cancel any in-progress run for the same sub-PR so only one workflow run
+      # executes the polling loop for a given PR, avoiding redundant runs and
+      # unnecessary use of runner time and API rate-limit.
+      cancel-in-progress: true
+    steps:
+      - name: Verify this is a sub-PR with a parent PR
+        id: verify-parent
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          PARENT_PR=$(gh pr list -R "$REPO" --state open \
+            --head "$BASE_REF" --base "$DEFAULT_BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$PARENT_PR" ] && [ "$PARENT_PR" != "null" ]; then
+            echo "This is a sub-PR — base branch '$BASE_REF' is the head of parent PR #$PARENT_PR."
+            echo "has_parent=true" >> $GITHUB_OUTPUT
+            echo "parent_number=$PARENT_PR" >> $GITHUB_OUTPUT
+          else
+            echo "Not a sub-PR (no parent PR found for base branch '$BASE_REF'). Skipping."
+            echo "has_parent=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Remove Copilot reviewer from sub-PR
+        if: steps.verify-parent.outputs.has_parent == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "Removing Copilot as reviewer from sub-PR #$PR_NUMBER..."
+          gh pr edit "$PR_NUMBER" -R "$REPO" --remove-reviewer @copilot 2>/dev/null \
+            || echo "Note: Could not remove Copilot reviewer (may not have been added)."
+
+      - name: Wait for agent to finish work
+        if: steps.verify-parent.outputs.has_parent == 'true'
+        id: wait-for-finish
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          POLL_INTERVAL=15
+          MAX_WAIT=900  # DO NOT revert to 300 — 900s is intentional (see commit history)
+          ELAPSED=0
+          FOUND_FINISHED=false
+
+          echo "Waiting for agent to finish work on sub-PR #$PR_NUMBER (polling every ${POLL_INTERVAL}s, max ${MAX_WAIT}s)..."
+
+          while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
+            # Detect agent completion by checking if it requested a review from
+            # a human user (.type == "User"). This is the most reliable signal —
+            # Copilot SWE agent requests review from the repo owner when done.
+            # DO NOT revert to "finished work" text polling (see commit c04dc8f).
+            REVIEW_REQUESTED=$(gh api "repos/$REPO/pulls/$PR_NUMBER/requested_reviewers" \
+              2>/dev/null | jq \
+              '[.users[]? | select(.type == "User")] | length' \
+              || echo "0")
+
+            if [ "$REVIEW_REQUESTED" -gt 0 ]; then
+              echo "Agent has finished work on sub-PR #$PR_NUMBER (detected via review request for a human user)."
+              FOUND_FINISHED=true
+              break
+            fi
+
+            # Suppress Copilot review on sub-PR (repo-level auto-review may re-add)
+            gh pr edit "$PR_NUMBER" -R "$REPO" --remove-reviewer @copilot 2>/dev/null || true
+            # Dismiss any Copilot reviews that slipped through
+            COPILOT_REVIEWS=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+              --jq '[.[] | select(.user.login == "Copilot" and .state != "DISMISSED")] | .[].id' 2>/dev/null || true)
+            for RID in $COPILOT_REVIEWS; do
+              gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$RID/dismissals" \
+                --method PUT --field 'message=Auto-dismissed: sub-PR does not need Copilot review.' 2>/dev/null || true
+            done
+
+            echo "Agent still working (${ELAPSED}s / ${MAX_WAIT}s)..."
+            sleep "$POLL_INTERVAL"
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+          done
+
+          if [ "$FOUND_FINISHED" = "true" ]; then
+            echo "finished=true" >> $GITHUB_OUTPUT
+          else
+            echo "::warning::Timed out waiting for agent to finish after ${MAX_WAIT}s."
+            echo "finished=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Mark ready and merge sub-PR
+        if: steps.verify-parent.outputs.has_parent == 'true' && steps.wait-for-finish.outputs.finished == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+        run: |
+          # Exit early if another run already merged this PR
+          PR_STATE=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.state' 2>/dev/null || echo "unknown")
+          if [ "$PR_STATE" != "open" ]; then
+            echo "PR #$PR_NUMBER is already $PR_STATE — skipping merge."
+            exit 0
+          fi
+
+          echo "Auto-merging sub-PR #$PR_NUMBER into $BASE_REF..."
+
+          # Step 1: Ensure PR is not a draft
+          IS_DRAFT=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.draft')
+          if [ "$IS_DRAFT" = "true" ]; then
+            gh pr ready "$PR_NUMBER" -R "$REPO" \
+              || echo "::warning::Could not mark sub-PR as ready."
+          fi
+
+          # Step 2: Remove Copilot as reviewer
+          gh pr edit "$PR_NUMBER" -R "$REPO" --remove-reviewer @copilot 2>/dev/null || true
+
+          # Step 3: Dismiss ALL blocking Copilot reviews (CHANGES_REQUESTED and COMMENTED)
+          dismiss_copilot_reviews() {
+            COPILOT_REVIEWS=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+              --jq '[.[] | select(.user.login == "Copilot" and (.state == "CHANGES_REQUESTED" or .state == "COMMENTED"))] | .[].id' \
+              2>/dev/null || true)
+            for RID in $COPILOT_REVIEWS; do
+              echo "Dismissing Copilot review $RID before merge..."
+              gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$RID/dismissals" \
+                --method PUT --field 'message=Auto-dismissed for sub-PR auto-merge.' 2>/dev/null || true
+            done
+          }
+          dismiss_copilot_reviews
+
+          # Step 4: Approve the PR with PAT to satisfy review requirements
+          gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+            --method POST \
+            --field 'event=APPROVE' \
+            --field 'body=Auto-approved: sub-PR merged by automation.' \
+            2>/dev/null || echo "::warning::Could not approve sub-PR (PAT may lack permission or is PR author)."
+
+          # Step 5: Merge with retry (re-dismiss reviews between attempts)
+          MAX_RETRIES=3
+          RETRY=0
+          MERGED=false
+          while [ "$RETRY" -lt "$MAX_RETRIES" ]; do
+            if gh pr merge "$PR_NUMBER" -R "$REPO" --merge; then
+              echo "Successfully merged sub-PR #$PR_NUMBER into $BASE_REF."
+              echo "The parent PR will receive a synchronize event and the recursive loop will review the changes."
+              MERGED=true
+              break
+            fi
+            RETRY=$((RETRY + 1))
+            echo "Merge attempt $RETRY/$MAX_RETRIES failed — retrying in 10s..."
+            sleep 10
+            # Re-dismiss any reviews that appeared between retries
+            dismiss_copilot_reviews
+          done
+
+          if [ "$MERGED" != "true" ]; then
+            echo "::error::Failed to merge sub-PR #$PR_NUMBER after $MAX_RETRIES attempts."
+            exit 1
+          fi

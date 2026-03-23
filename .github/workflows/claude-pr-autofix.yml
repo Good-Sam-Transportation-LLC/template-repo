@@ -1,0 +1,393 @@
+name: Claude PR Auto-Fix
+
+on:
+  workflow_run:
+    workflows: ["Autonomous AI Loop: Review ➔ Fix"]
+    types: [completed]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+  actions: read
+
+concurrency:
+  group: pr-autofix-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: true
+
+jobs:
+  auto-fix:
+    name: Auto-Fix PR Issues with Claude
+    runs-on: ubuntu-latest
+    # Only run if the Copilot SWE loop workflow succeeded
+    if: github.event.workflow_run.conclusion == 'success'
+    steps:
+      - name: Check for API key
+        id: check-key
+        run: |
+          if [ -z "${{ secrets.ANTHROPIC_API_KEY }}" ]; then
+            echo "ANTHROPIC_API_KEY is not set — skipping Claude auto-fix."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Check if Copilot SWE loop has reached a terminal state
+        if: steps.check-key.outputs.skip == 'false'
+        id: check-loop-done
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.COPILOT_PAT }}
+          script: |
+            // Gate: only proceed if the Copilot review/fix loop has truly stopped.
+            // The loop is done when one of these terminal states is reached:
+            //   1. Copilot's latest review is an APPROVAL
+            //   2. "Auto-fix loop complete!" comment (no issues found)
+            //   3. "Auto-fix loop stopped" comment (circuit breaker hit)
+            // If none of these, the loop is mid-cycle (call-reviewer requested
+            // a review, or evaluate-and-fix just called the SWE agent) — skip.
+
+            const headBranch = context.payload.workflow_run.head_branch;
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${headBranch}`,
+              state: 'open',
+            });
+            if (prs.length === 0) {
+              console.log(`No open PR for branch ${headBranch} — skipping.`);
+              core.setOutput('proceed', 'false');
+              return;
+            }
+            const prNumber = prs[0].number;
+            console.log(`Checking loop status for PR #${prNumber} on branch ${headBranch}...`);
+
+            // --- Terminal condition 1: Copilot approved the PR ---
+            // Use pagination to ensure we get all reviews (not just the first 30)
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: prNumber,
+            });
+            const copilotReviews = reviews.filter(
+              r => (r.user?.login || '').toLowerCase().includes('copilot')
+            );
+            if (copilotReviews.length > 0) {
+              const latest = copilotReviews[copilotReviews.length - 1];
+              if (latest.state === 'APPROVED') {
+                console.log(`Copilot approved PR #${prNumber} — loop is done. Proceeding.`);
+                core.setOutput('proceed', 'true');
+                return;
+              }
+            }
+
+            // --- Terminal conditions 2 & 3: check PR comments for markers ---
+            const TERMINAL_MARKERS = [
+              'Auto-fix loop complete!',   // posted when no issues found
+              'Auto-fix loop stopped',     // posted when circuit breaker hit
+            ];
+            const SWE_INVOCATION_MARKER = 'The Copilot Code Reviewer found issues';
+
+            // Use pagination to ensure we consider all comments (not just the first 100)
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: prNumber,
+              per_page: 100,
+            });
+
+            // Find the latest terminal marker and the latest SWE invocation
+            let latestTerminalTime = null;
+            let latestTerminalBody = '';
+            let latestSweTime = null;
+
+            for (const c of comments) {
+              const body = c.body || '';
+              const created = new Date(c.created_at);
+
+              if (TERMINAL_MARKERS.some(m => body.includes(m))) {
+                if (!latestTerminalTime || created > latestTerminalTime) {
+                  latestTerminalTime = created;
+                  latestTerminalBody = body;
+                }
+              }
+              if (body.includes(SWE_INVOCATION_MARKER)) {
+                if (!latestSweTime || created > latestSweTime) {
+                  latestSweTime = created;
+                }
+              }
+            }
+
+            if (latestTerminalTime) {
+              if (latestSweTime && latestSweTime > latestTerminalTime) {
+                // SWE was invoked after the last terminal marker — active fix request outstanding
+                console.log('Active SWE fix request exists after terminal state — proceeding.');
+                core.setOutput('proceed', 'true');
+                return;
+              }
+              // Terminal state reached with no newer fix request — skip auto-fix
+              const marker = TERMINAL_MARKERS.find(m => latestTerminalBody.includes(m));
+              console.log(`Loop terminal state detected: "${marker}" — no active fix request, skipping auto-fix.`);
+              core.setOutput('proceed', 'false');
+              return;
+            }
+
+            // No terminal marker — loop is mid-cycle. Skipping.
+            console.log('No terminal state detected — loop is mid-cycle. Skipping.');
+            core.setOutput('proceed', 'false');
+
+      - uses: actions/checkout@v4
+        if: steps.check-key.outputs.skip == 'false' && steps.check-loop-done.outputs.proceed == 'true'
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          token: ${{ secrets.COPILOT_PAT }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        if: steps.check-key.outputs.skip == 'false' && steps.check-loop-done.outputs.proceed == 'true'
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        if: steps.check-key.outputs.skip == 'false' && steps.check-loop-done.outputs.proceed == 'true'
+        run: npm ci
+
+      - name: Collect unresolved review threads and apply fixes
+        if: steps.check-key.outputs.skip == 'false' && steps.check-loop-done.outputs.proceed == 'true'
+        id: apply-fixes
+        uses: actions/github-script@v7
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        with:
+          github-token: ${{ secrets.COPILOT_PAT }}
+          script: |
+            const fs = require('fs');
+
+            // Find the PR associated with the workflow_run head branch
+            const headBranch = context.payload.workflow_run.head_branch;
+            const { data: prs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${headBranch}`,
+              state: 'open',
+            });
+            if (prs.length === 0) {
+              console.log(`No open PR found for branch ${headBranch} — skipping.`);
+              core.setOutput('changed', 'false');
+              return;
+            }
+            const prNumber = prs[0].number;
+            console.log(`Copilot SWE loop completed on branch ${headBranch} — found PR #${prNumber}`);
+
+            // Collect all unresolved review threads
+            const { repository } = await github.graphql(`
+              query($owner: String!, $repo: String!, $prNumber: Int!) {
+                repository(owner: $owner, name: $repo) {
+                  pullRequest(number: $prNumber) {
+                    reviewThreads(first: 100) {
+                      nodes {
+                        isResolved
+                        comments(first: 20) {
+                          nodes {
+                            body
+                            path
+                            line
+                            startLine
+                            author { login }
+                            diffHunk
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            `, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              prNumber,
+            });
+
+            const unresolvedThreads = repository.pullRequest.reviewThreads.nodes.filter(
+              t => !t.isResolved
+            );
+
+            if (unresolvedThreads.length === 0) {
+              console.log('No unresolved review threads found.');
+              core.setOutput('changed', 'false');
+              return;
+            }
+
+            console.log(`Found ${unresolvedThreads.length} unresolved thread(s).`);
+            let anyChanged = false;
+
+            for (const thread of unresolvedThreads) {
+              const firstComment = thread.comments.nodes[0];
+              if (!firstComment || !firstComment.path) continue;
+
+              const body = firstComment.body || '';
+              const filePath = firstComment.path;
+              const endLine = parseInt(firstComment.line ?? firstComment.startLine, 10) || 0;
+              const startLine = parseInt(firstComment.startLine ?? firstComment.line, 10) || endLine;
+
+              // Check for explicit suggestion block first
+              const suggestionRegex = /```suggestion\n([\s\S]*?)```/g;
+              const suggestions = [];
+              let match;
+              while ((match = suggestionRegex.exec(body)) !== null) {
+                suggestions.push(match[1]);
+              }
+
+              if (suggestions.length > 0) {
+                // Apply suggestion block directly
+                if (!fs.existsSync(filePath)) {
+                  console.log(`File not found: ${filePath} — skipping`);
+                  continue;
+                }
+                const lines = fs.readFileSync(filePath, 'utf8').split('\n');
+                const totalLines = lines.length;
+                if (startLine < 1 || endLine < startLine || endLine > totalLines) {
+                  console.log(
+                    `  Invalid line range ${startLine}–${endLine} for ${filePath} (file has ${totalLines} line(s)) — skipping suggestion`,
+                  );
+                  continue;
+                }
+                const before = lines.slice(0, startLine - 1);
+                const after = lines.slice(endLine);
+                const replacementLines = suggestions[0].split('\n');
+                if (replacementLines[replacementLines.length - 1] === '') replacementLines.pop();
+                const updated = [...before, ...replacementLines, ...after].join('\n');
+                fs.writeFileSync(filePath, updated);
+                console.log(`Applied suggestion block to ${filePath} (lines ${startLine}–${endLine})`);
+                anyChanged = true;
+                continue;
+              }
+
+              // Free-text comment — use Claude to understand and apply fix
+              if (!fs.existsSync(filePath)) {
+                console.log(`File not found: ${filePath} — skipping free-text fix`);
+                continue;
+              }
+
+              const fileContent = fs.readFileSync(filePath, 'utf8');
+              const fileLines = fileContent.split('\n');
+              // Show surrounding context (10 lines before/after)
+              const ctxStart = Math.max(0, (startLine || 1) - 11);
+              const ctxEnd = Math.min(fileLines.length, (endLine || 1) + 10);
+              const codeSnippet = fileLines.slice(ctxStart, ctxEnd)
+                .map((l, i) => `${ctxStart + i + 1}: ${l}`)
+                .join('\n');
+
+              const diffContext = firstComment.diffHunk || '';
+
+              const prompt = [
+                'You are a code reviewer\'s assistant. A reviewer left a comment on a file asking for a change. Apply the change directly to the full file content and return ONLY the complete updated file content — no explanations, no markdown code fences, no diff format.',
+                '',
+                `File: ${filePath}`,
+                '',
+                `Reviewer's comment (about lines ${startLine}–${endLine}):`,
+                body,
+                '',
+                'Diff context (the exact code block being reviewed):',
+                '```diff',
+                diffContext,
+                '```',
+                '',
+                `Relevant code snippet (lines ${ctxStart + 1}–${ctxEnd}):`,
+                '```',
+                codeSnippet,
+                '```',
+                '',
+                'Full current file content:',
+                '```',
+                fileContent,
+                '```',
+                '',
+                'Return ONLY the complete updated file content with the reviewer\'s requested change applied. Do not include any explanation or markdown fencing.',
+              ].join('\n');
+
+              let updatedContent;
+              try {
+                const MAX_API_RETRIES = 3;
+                const API_BACKOFF_DELAYS = [30000, 60000, 120000]; // 30s, 60s, 120s
+                let response;
+                let apiSuccess = false;
+
+                for (let apiAttempt = 0; apiAttempt <= MAX_API_RETRIES; apiAttempt++) {
+                  response = await fetch('https://api.anthropic.com/v1/messages', {
+                    method: 'POST',
+                    headers: {
+                      'Content-Type': 'application/json',
+                      'x-api-key': process.env.ANTHROPIC_API_KEY,
+                      'anthropic-version': '2023-06-01',
+                    },
+                    body: JSON.stringify({
+                      model: 'claude-sonnet-4-6',
+                      max_tokens: 8192,
+                      messages: [{ role: 'user', content: prompt }],
+                    }),
+                  });
+
+                  if (response.ok) {
+                    apiSuccess = true;
+                    break;
+                  }
+
+                  if (response.status === 429 && apiAttempt < MAX_API_RETRIES) {
+                    const delay = API_BACKOFF_DELAYS[apiAttempt];
+                    console.log(`Claude API rate-limited (429). Retrying in ${delay / 1000}s... (attempt ${apiAttempt + 1}/${MAX_API_RETRIES})`);
+                    await new Promise(res => setTimeout(res, delay));
+                    continue;
+                  }
+
+                  const err = await response.text();
+                  console.log(`Claude API error (${response.status}): ${err} — skipping ${filePath}`);
+                  break;
+                }
+
+                if (!apiSuccess) continue;
+
+                const data = await response.json();
+                updatedContent = data.content[0].text;
+
+                // Strip markdown code fences if Claude wrapped the output
+                const fenceMatch = updatedContent.match(/^```[^\n]*\n([\s\S]*?)```\s*$/);
+                if (fenceMatch) updatedContent = fenceMatch[1];
+
+              } catch (err) {
+                console.log(`Claude API call failed for ${filePath}: ${err.message} — skipping`);
+                continue;
+              }
+
+              if (updatedContent && updatedContent !== fileContent) {
+                fs.writeFileSync(filePath, updatedContent);
+                console.log(`Claude applied free-text fix to ${filePath}`);
+                anyChanged = true;
+              } else {
+                console.log(`No change produced by Claude for ${filePath}`);
+              }
+            }
+
+            core.setOutput('changed', anyChanged ? 'true' : 'false');
+
+      - name: Run lint and tests
+        if: steps.apply-fixes.outputs.changed == 'true'
+        run: |
+          npm run lint || { echo "::warning::Lint failed after applying fixes — committing anyway"; }
+          npm test || { echo "::warning::Tests failed after applying fixes — committing anyway"; }
+
+      - name: Commit and push fixes
+        if: steps.apply-fixes.outputs.changed == 'true'
+        env:
+          GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No file changes to commit."
+          else
+            git commit -m "fix: auto-apply PR review suggestions via Claude"
+            bash .github/scripts/push-with-scan-wait.sh
+          fi

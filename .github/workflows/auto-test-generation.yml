@@ -1,0 +1,123 @@
+name: Auto Test Generation
+
+on:
+  push:
+    branches: ["**"]
+
+permissions:
+  contents: write
+  pull-requests: write
+  checks: read
+
+jobs:
+  generate-tests:
+    name: Generate Tests for Fixes
+    if: >-
+      github.event.head_commit.author.name == 'github-actions[bot]' ||
+      github.event.head_commit.author.name == 'copilot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.COPILOT_PAT }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Find changed files missing tests
+        id: find-missing
+        run: |
+          # Get files changed in the last commit
+          CHANGED=$(git diff --name-only HEAD~1 HEAD | grep -E '^src/.*\.(ts|tsx)$' || true)
+
+          if [ -z "$CHANGED" ]; then
+            echo "No source files changed."
+            echo "missing=" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          MISSING=""
+          while IFS= read -r file; do
+            # Skip files that don't need tests
+            case "$file" in
+              src/components/ui/*) continue ;;
+              src/test/*) continue ;;
+              *.test.ts|*.test.tsx) continue ;;
+              *.spec.ts|*.spec.tsx) continue ;;
+              *.d.ts) continue ;;
+              src/main.tsx) continue ;;
+              src/vite-env.d.ts) continue ;;
+            esac
+
+            # Check for existing test
+            dir=$(dirname "$file")
+            basename_file=$(basename "$file")
+            name="${basename_file%.*}"
+            ext="${basename_file##*.}"
+            expected_test="${dir}/__tests__/${name}.test.${ext}"
+
+            if [ ! -f "$expected_test" ]; then
+              MISSING="$MISSING $file"
+            fi
+          done <<< "$CHANGED"
+
+          MISSING=$(echo "$MISSING" | xargs)
+          echo "missing=$MISSING" >> $GITHUB_OUTPUT
+
+          if [ -n "$MISSING" ]; then
+            echo "Files missing tests: $MISSING"
+          else
+            echo "All changed files have tests."
+          fi
+
+      - name: Install OpenAI Codex CLI
+        if: steps.find-missing.outputs.missing != ''
+        run: npm install -g @openai/codex
+
+      - name: Generate tests with Codex
+        if: steps.find-missing.outputs.missing != ''
+        env:
+          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+        run: |
+          if [ -z "$CODEX_API_KEY" ]; then
+            echo "::error::CODEX_API_KEY secret not set — cannot run Codex test generation. Add the secret in repository Settings → Secrets to enable AI-powered test generation."
+            exit 1
+          fi
+          for file in ${{ steps.find-missing.outputs.missing }}; do
+            dir=$(dirname "$file")
+            basename_file=$(basename "$file")
+            name="${basename_file%.*}"
+            ext="${basename_file##*.}"
+            test_dir="${dir}/__tests__"
+            test_file="${test_dir}/${name}.test.${ext}"
+
+            mkdir -p "$test_dir"
+
+            echo "Generating test for: $file -> $test_file"
+            codex exec --dangerously-bypass-approvals-and-sandbox \
+              "Read the source file at '$file' and generate a comprehensive test suite for it. Write the test file to '$test_file'. Use Vitest with imports from 'vitest'. Use @testing-library/react for component tests. Use the import alias '@/' for src/ imports. Follow the existing test patterns in this repository. Include tests for all exported functions, components, and hooks. Make sure all tests are meaningful and pass."
+          done
+
+      - name: Run generated tests
+        if: steps.find-missing.outputs.missing != ''
+        run: npm test
+
+      - name: Commit generated tests
+        if: steps.find-missing.outputs.missing != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "src/**/__tests__/*.test.*"
+          if git diff --cached --quiet; then
+            echo "No new test files to commit."
+          else
+            git commit -m "Auto-generate test suite for recent fixes"
+            bash .github/scripts/push-with-scan-wait.sh
+          fi

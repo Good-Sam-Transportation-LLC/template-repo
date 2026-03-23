@@ -1,0 +1,122 @@
+name: Workflow Autofix
+
+on:
+  workflow_run:
+    workflows: ["CI", "CodeQL", "Auto Test Generation"]
+    types: [completed]
+
+permissions:
+  contents: write
+  actions: read
+  checks: read
+
+jobs:
+  autofix:
+    name: Auto-Fix Failed Workflow
+    if: github.event.workflow_run.conclusion == 'failure'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_branch }}
+          token: ${{ secrets.COPILOT_PAT }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Get failed workflow logs
+        id: logs
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.COPILOT_PAT }}
+          script: |
+            const runId = context.payload.workflow_run.id;
+            const jobs = await github.rest.actions.listJobsForWorkflowRun({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              run_id: runId,
+            });
+
+            let errorLogs = '';
+            for (const job of jobs.data.jobs) {
+              if (job.conclusion === 'failure') {
+                try {
+                  const logs = await github.rest.actions.downloadJobLogsForWorkflowRun({
+                    owner: context.repo.owner,
+                    repo: context.repo.repo,
+                    job_id: job.id,
+                  });
+                  errorLogs += `\n--- Job: ${job.name} ---\n${logs.data}\n`;
+                } catch (e) {
+                  errorLogs += `\n--- Job: ${job.name} (log fetch failed) ---\n`;
+                }
+              }
+            }
+
+            // Truncate to avoid token limits
+            const truncated = errorLogs.substring(0, 10000);
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/error-logs.txt', truncated);
+            return truncated.substring(0, 500);
+
+      - name: Install OpenAI Codex CLI
+        run: npm install -g @openai/codex
+
+      - name: Diagnose and fix errors
+        env:
+          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+        run: |
+          if [ -z "$CODEX_API_KEY" ]; then
+            echo "::error::CODEX_API_KEY secret not set — cannot run Codex autofix. Add the secret in repository Settings → Secrets to enable AI-powered workflow repair."
+            exit 1
+          fi
+          WORKFLOW_NAME="${{ github.event.workflow_run.name }}"
+          ERROR_LOGS=$(cat /tmp/error-logs.txt 2>/dev/null || echo "No logs available")
+
+          codex exec -a never --sandbox workspace-write \
+            "The GitHub Actions workflow '${WORKFLOW_NAME}' has failed. Here are the error logs:
+
+          ${ERROR_LOGS}
+
+          Diagnose the issue and fix it. Common fixes include:
+          - Fix syntax errors in source code
+          - Fix TypeScript type errors
+          - Fix ESLint violations
+          - Fix failing tests
+          - Fix workflow YAML syntax errors
+          - Update dependencies if needed
+
+          After fixing, verify by running: npm run lint && npm run typecheck && npm test
+          PROMPTEOF
+
+          # Replace placeholders safely (no shell injection)
+          PROMPT_CONTENT=$(cat /tmp/codex-prompt.txt)
+          PROMPT_CONTENT="${PROMPT_CONTENT/WORKFLOW_NAME_PLACEHOLDER/$WORKFLOW_NAME}"
+          PROMPT_CONTENT="${PROMPT_CONTENT/ERROR_LOGS_PLACEHOLDER/$ERROR_LOGS}"
+          echo "$PROMPT_CONTENT" > /tmp/codex-prompt.txt
+
+          codex exec -a never --sandbox workspace-write "$(cat /tmp/codex-prompt.txt)"
+
+      - name: Verify fix
+        run: |
+          npm run lint
+          npm run typecheck
+          npm test
+
+      - name: Commit and push fix
+        env:
+          GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+          else
+            git commit -m "Auto-fix: resolve ${WORKFLOW_NAME} workflow failure"
+            bash .github/scripts/push-with-scan-wait.sh
+          fi

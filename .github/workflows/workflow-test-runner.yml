@@ -1,0 +1,48 @@
+name: Workflow Test Runner
+
+on:
+  push:
+    paths:
+      - ".github/workflows/*.yml"
+    branches: ["**"]
+
+permissions:
+  contents: write
+  checks: read
+
+jobs:
+  test-workflows:
+    name: Generate & Run Workflow Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.COPILOT_PAT }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Generate tests for new workflows
+        run: bash .github/scripts/generate-workflow-tests.sh
+
+      - name: Run all tests
+        run: npm test
+
+      - name: Commit generated test files
+        env:
+          GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add src/test/*-workflow.test.ts 2>/dev/null || true
+          if git diff --cached --quiet; then
+            echo "No new workflow test files to commit."
+          else
+            git commit -m "Auto-generate tests for workflow changes"
+            bash .github/scripts/push-with-scan-wait.sh
+          fi

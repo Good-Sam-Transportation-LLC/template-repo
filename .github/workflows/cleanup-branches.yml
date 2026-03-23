@@ -1,0 +1,74 @@
+name: Cleanup branches
+
+on:
+  workflow_dispatch:
+
+jobs:
+  delete-branches:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Delete all non-essential remote branches
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          KEEP_BRANCHES="${DEFAULT_BRANCH:-main} feature/tests develop release"
+
+          echo "Fetching all remote branches..."
+          git fetch --prune
+
+          echo "Branches to keep: $KEEP_BRANCHES"
+          echo ""
+
+          deleted=0
+          failed=0
+
+          while IFS= read -r branch; do
+            # Explicitly skip the symbolic origin/HEAD ref
+            if [ "$branch" = "origin/HEAD" ]; then
+              continue
+            fi
+
+            # Strip the remote prefix to get the branch name used on origin
+            branch_name=${branch#origin/}
+
+            skip=false
+            for keep in $KEEP_BRANCHES; do
+              if [ "$branch_name" = "$keep" ]; then
+                skip=true
+                break
+              fi
+            done
+
+            # Keep all claude/* branches
+            if [[ "$branch_name" == claude/* ]]; then
+              skip=true
+            fi
+
+            if [ "$skip" = true ]; then
+              echo "KEEP: $branch_name"
+              continue
+            fi
+
+            echo "DELETE: $branch_name"
+            if git push origin --delete "$branch_name"; then
+              deleted=$((deleted + 1))
+            else
+              echo "  FAILED to delete $branch_name"
+              failed=$((failed + 1))
+            fi
+          done < <(git for-each-ref refs/remotes/origin --format='%(refname:short)')
+
+          echo ""
+          echo "Summary: $deleted deleted, $failed failed"
+
+          if [ "$failed" -gt 0 ]; then
+            echo "::error::Failed to delete $failed branch(es)."
+            exit 1
+          fi

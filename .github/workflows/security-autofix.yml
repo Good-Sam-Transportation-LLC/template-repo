@@ -1,0 +1,198 @@
+name: Security Autofix
+
+on:
+  workflow_run:
+    workflows: ["CI", "CodeQL"]
+    types: [completed]
+  schedule:
+    - cron: "0 7 * * *"
+
+permissions:
+  contents: write
+  pull-requests: write
+  security-events: read
+  checks: read
+
+jobs:
+  fix-npm-audit:
+    name: Fix npm Audit Vulnerabilities
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.name == 'CI')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+          token: ${{ secrets.COPILOT_PAT }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Iterative npm audit fix
+        run: |
+          MAX_ATTEMPTS=3
+          FIXED=false
+
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            echo ""
+            echo "========================================="
+            echo "Attempt $i of $MAX_ATTEMPTS"
+            echo "========================================="
+
+            echo ""
+            echo "=== Running npm audit ==="
+            if npm audit --audit-level=high 2>&1; then
+              echo ""
+              echo "Audit passed clean on attempt $i — no high vulnerabilities found."
+              FIXED=true
+              break
+            fi
+
+            echo ""
+            echo "=== Attempting automatic fix (safe, no --force) ==="
+            npm audit fix 2>&1 || true
+
+            echo ""
+            echo "=== Validating dependency compatibility ==="
+            NPM_LS_OUTPUT="$(npm ls --depth=0 2>&1 || true)"
+            if echo "$NPM_LS_OUTPUT" | grep -qiE "ERESOLVE|peer dep|invalid"; then
+              echo "npm audit fix broke dependencies — rolling back."
+              git checkout -- package.json package-lock.json
+            fi
+
+            echo ""
+            echo "=== Rebuilding cleanly with npm ci ==="
+            npm ci 2>&1 || true
+          done
+
+          echo ""
+          echo "=== Final audit check ==="
+          npm audit --audit-level=high
+
+      - name: Verify fix doesn't break build
+        run: |
+          npm run lint
+          npm run typecheck
+          npm test
+
+      - name: Commit and push fixes
+        env:
+          GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          if git diff --cached --quiet; then
+            echo "No dependency changes to commit."
+          else
+            git commit -m "security: auto-fix npm audit vulnerabilities"
+            bash .github/scripts/push-with-scan-wait.sh
+          fi
+
+  fix-codeql-findings:
+    name: Fix CodeQL Security Findings
+    runs-on: ubuntu-latest
+    if: >-
+      github.event_name == 'schedule' ||
+      (github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.name == 'CodeQL')
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+          token: ${{ secrets.COPILOT_PAT }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Get CodeQL alerts
+        id: alerts
+        uses: actions/github-script@v7
+        with:
+          github-token: ${{ secrets.COPILOT_PAT }}
+          script: |
+            let alerts = [];
+            try {
+              const response = await github.rest.codeScanning.listAlertsForRepo({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                state: 'open',
+                per_page: 20,
+              });
+              alerts = response.data;
+            } catch (e) {
+              console.log('Could not fetch CodeQL alerts:', e.message);
+            }
+
+            if (alerts.length === 0) {
+              console.log('No open CodeQL alerts found.');
+              return '';
+            }
+
+            const summary = alerts.map(a =>
+              `- [${a.rule.severity}] ${a.rule.description} in ${a.most_recent_instance.location.path}:${a.most_recent_instance.location.start_line}`
+            ).join('\n');
+
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/codeql-alerts.txt', summary);
+            console.log(`Found ${alerts.length} open alerts`);
+            return summary.substring(0, 500);
+
+      - name: Install OpenAI Codex CLI
+        if: steps.alerts.outputs.result != ''
+        run: npm install -g @openai/codex
+
+      - name: Fix security findings with Codex
+        if: steps.alerts.outputs.result != ''
+        env:
+          CODEX_API_KEY: ${{ secrets.CODEX_API_KEY }}
+        run: |
+          if [ -z "$CODEX_API_KEY" ]; then
+            echo "::error::CODEX_API_KEY secret not set — cannot run Codex security fix. Add the secret in repository Settings → Secrets to enable AI-powered vulnerability remediation."
+            exit 1
+          fi
+          ALERTS=$(cat /tmp/codeql-alerts.txt 2>/dev/null || echo "No alerts file")
+
+          codex exec -a never --sandbox workspace-write \
+            "The following security vulnerabilities were detected by CodeQL static analysis:
+
+          ${ALERTS}
+
+          Fix each vulnerability. Common fixes include:
+          - Sanitize user inputs to prevent XSS
+          - Use parameterized queries to prevent SQL injection
+          - Validate and escape shell arguments to prevent command injection
+          - Remove hardcoded secrets and use environment variables
+          - Add proper input validation at system boundaries
+
+          After fixing, verify the changes are correct and don't break functionality."
+
+      - name: Verify fixes
+        if: steps.alerts.outputs.result != ''
+        run: |
+          npm run lint
+          npm run typecheck
+          npm test
+
+      - name: Commit and push fixes
+        if: steps.alerts.outputs.result != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No security fixes to commit."
+          else
+            git commit -m "security: auto-fix CodeQL vulnerability findings"
+            bash .github/scripts/push-with-scan-wait.sh
+          fi

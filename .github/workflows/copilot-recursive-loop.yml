@@ -1,0 +1,1172 @@
+name: "Autonomous AI Loop: Review ➔ Fix"
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  pull_request_review:
+    types: [submitted]
+
+permissions:
+  contents: read
+  pull-requests: write
+  issues: write
+
+jobs:
+  # ==========================================================
+  # PHASE 1: Call the Copilot Code Reviewer
+  # Runs when a PR is opened or new commits are pushed
+  # (by a human OR the SWE agent — the push restarts the loop).
+  # ==========================================================
+  call-reviewer:
+    name: Request Copilot Review
+    if: >
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    concurrency:
+      group: copilot-review-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Check if this PR is a sub-PR
+        id: check-is-sub-pr
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # A sub-PR's base branch is the head branch of another open PR (the parent)
+          PARENT_PR=$(gh pr list -R "$REPO" --state open \
+            --head "$BASE_REF" --base "$DEFAULT_BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$PARENT_PR" ] && [ "$PARENT_PR" != "null" ]; then
+            echo "This PR is a sub-PR — base branch '$BASE_REF' is the head of parent PR #$PARENT_PR."
+            echo "is_sub_pr=true" >> $GITHUB_OUTPUT
+          else
+            echo "Not a sub-PR."
+            echo "is_sub_pr=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Mark draft PR as ready for review
+        if: steps.check-is-sub-pr.outputs.is_sub_pr == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Copilot code reviewer does NOT review draft PRs.
+          IS_DRAFT=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.draft')
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo "PR #$PR_NUMBER is a draft — marking as ready for review..."
+            gh pr ready "$PR_NUMBER" -R "$REPO" \
+              || echo "Could not mark PR as ready — may require different permissions."
+          else
+            echo "PR #$PR_NUMBER is already ready for review."
+          fi
+
+      - name: Dismiss previous Copilot review (so re-request works)
+        if: steps.check-is-sub-pr.outputs.is_sub_pr == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # GitHub won't let you re-request a review from someone who already
+          # submitted one. Dismiss the old review first (mirrors the UI button).
+          # CHANGES_REQUESTED and APPROVED can be dismissed directly.
+          # COMMENTED reviews cannot be dismissed (422), so we dismiss ALL
+          # non-COMMENTED reviews to clear the reviewer slot.
+          REVIEWS=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+            | jq -s 'flatten | map(select(.user.login == "Copilot" and .state != "DISMISSED"))')
+
+          REVIEW_COUNT=$(echo "$REVIEWS" | jq 'length')
+          echo "Found $REVIEW_COUNT active Copilot review(s)."
+
+          if [ "$REVIEW_COUNT" -eq 0 ]; then
+            echo "No previous Copilot review to dismiss."
+          else
+            # Dismiss all dismissable reviews (CHANGES_REQUESTED, APPROVED)
+            DISMISSABLE=$(echo "$REVIEWS" | jq -r '.[] | select(.state == "CHANGES_REQUESTED" or .state == "APPROVED") | .id')
+            for REVIEW_ID in $DISMISSABLE; do
+              echo "Dismissing Copilot review $REVIEW_ID..."
+              gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/dismissals" \
+                --method PUT \
+                --field 'message=Dismissing to re-request automated review after new commits.' \
+                || echo "::warning::Could not dismiss review $REVIEW_ID"
+            done
+
+            # For COMMENTED reviews: delete them so re-request works.
+            # GitHub allows deleting pending/COMMENTED reviews via DELETE endpoint.
+            COMMENTED=$(echo "$REVIEWS" | jq -r '.[] | select(.state == "COMMENTED") | .id')
+            for REVIEW_ID in $COMMENTED; do
+              echo "Deleting COMMENTED Copilot review $REVIEW_ID (cannot dismiss, using DELETE)..."
+              gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" \
+                --method DELETE \
+                || echo "::warning::Could not delete COMMENTED review $REVIEW_ID — re-request may fail."
+            done
+          fi
+
+      # ──────────────────────────────────────────────────────────────────────────
+      # Auto-resolve stale review threads
+      # ──────────────────────────────────────────────────────────────────────────
+      # NOTE: This step is intentionally part of the recursive-loop workflow (not
+      # the standalone sub-pr-auto-merge workflow). After each push it resolves
+      # threads whose diff lines changed AND the thread is marked outdated by
+      # GitHub, or threads whose suggested code change has been applied verbatim.
+      # Only threads already flagged by GitHub as `isOutdated` are eligible for
+      # line-overlap resolution, preventing active threads from being silently
+      # dismissed just because surrounding code changed.
+      - name: Auto-resolve stale review threads after code changes
+        if: steps.check-is-sub-pr.outputs.is_sub_pr == 'false'
+        uses: actions/github-script@v7
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+        with:
+          github-token: ${{ secrets.COPILOT_PAT }}
+          script: |
+            const prNumber = parseInt('${{ github.event.pull_request.number }}', 10);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headSha = '${{ github.event.pull_request.head.sha }}';
+            //    Use immutable base SHA instead of baseRef (branch name) so results are
+            //    stable for this PR revision. Branch refs can advance while the PR is open,
+            //    which would include unrelated upstream changes in the diff and could cause
+            //    active review threads to be auto-resolved incorrectly.
+            // ──────────────────────────────────────────────────────────
+            const baseSha = context.payload.pull_request.base.sha;
+
+            // ──────────────────────────────────────────────────────────
+            // 1. Fetch all unresolved review threads (paginated GraphQL)
+            // ──────────────────────────────────────────────────────────
+            let allThreads = [];
+            let hasNextPage = true;
+            let cursor = null;
+
+            while (hasNextPage) {
+              const afterClause = cursor ? `, after: "${cursor}"` : '';
+              const query = `
+                query($owner: String!, $repo: String!, $prNumber: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $prNumber) {
+                      reviewThreads(first: 100${afterClause}) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes {
+                          id
+                          isResolved
+                          isOutdated
+                          comments(first: 1) {
+                            nodes { id, body, path, line, startLine }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+              const result = await github.graphql(query, { owner, repo, prNumber });
+              const threads = result.repository.pullRequest.reviewThreads;
+              allThreads.push(...threads.nodes);
+              hasNextPage = threads.pageInfo.hasNextPage;
+              cursor = threads.pageInfo.endCursor;
+            }
+
+            const unresolvedThreads = allThreads.filter(t => !t.isResolved);
+            console.log(`Found ${unresolvedThreads.length} unresolved thread(s) to check for staleness.`);
+
+            if (unresolvedThreads.length === 0) return;
+
+            // ──────────────────────────────────────────────────────────
+            // 2. Get the diff (changed files + line ranges) via compare API
+            // ──────────────────────────────────────────────────────────
+            const compare = await github.rest.repos.compareCommitsWithBasehead({
+              owner,
+              repo,
+              basehead: `${baseSha}...${headSha}`,
+            });
+
+            // Build a map: filePath → array of { start, end } changed line ranges
+            const changedRanges = new Map();
+            for (const file of (compare.data.files || [])) {
+              if (!file.patch) continue;
+              const ranges = [];
+              // Parse unified diff hunks: @@ -old,count +new,count @@
+              const hunkRegex = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@/gm;
+              let match;
+              while ((match = hunkRegex.exec(file.patch)) !== null) {
+                const start = parseInt(match[1], 10);
+                const count = match[2] !== undefined ? parseInt(match[2], 10) : 1;
+                // In unified diff syntax, "+start,0" means zero new lines; skip such hunks
+                if (count === 0) continue;
+                ranges.push({ start, end: start + count - 1 });
+              }
+              if (ranges.length > 0) {
+                changedRanges.set(file.filename, ranges);
+              }
+            }
+
+            // ──────────────────────────────────────────────────────────
+            // 3. Helpers for suggestion matching (reuse existing pattern)
+            // ──────────────────────────────────────────────────────────
+            const suggestionRegex = /```suggestion\s*\n([\s\S]*?)```/g;
+
+            function extractSuggestions(body) {
+              const suggestions = [];
+              let m;
+              while ((m = suggestionRegex.exec(body)) !== null) {
+                suggestions.push(m[1]);
+              }
+              suggestionRegex.lastIndex = 0;
+              return suggestions.length > 0 ? suggestions : null;
+            }
+
+            function normalize(str) {
+              return str.replace(/[ \t]+$/gm, '').replace(/\r\n/g, '\n').trimEnd();
+            }
+
+            const fileCache = new Map();
+
+            async function getFileContent(filePath) {
+              if (fileCache.has(filePath)) return fileCache.get(filePath);
+              try {
+                const { data } = await github.rest.repos.getContent({
+                  owner, repo, path: filePath, ref: headSha,
+                });
+                const content = Buffer.from(data.content, 'base64').toString('utf-8');
+                fileCache.set(filePath, content);
+                return content;
+              } catch (e) {
+                fileCache.set(filePath, null);
+                return null;
+              }
+            }
+
+            // ──────────────────────────────────────────────────────────
+            // 4. Check each unresolved thread and resolve if stale
+            // ──────────────────────────────────────────────────────────
+            let resolvedCount = 0;
+            let skippedCount = 0;
+
+            for (const thread of unresolvedThreads) {
+              const firstComment = thread.comments.nodes[0];
+              if (!firstComment || !firstComment.path) {
+                skippedCount++;
+                continue;
+              }
+
+              const filePath = firstComment.path;
+              const commentLine = firstComment.line || firstComment.startLine;
+              const commentStartLine = firstComment.startLine || firstComment.line;
+
+              // Check 1: Does the diff touch this file + line range?
+              const ranges = changedRanges.get(filePath);
+              let linesChanged = false;
+              if (ranges && commentLine) {
+                const cStart = commentStartLine || commentLine;
+                const cEnd = commentLine;
+                linesChanged = ranges.some(r =>
+                  cStart <= r.end && cEnd >= r.start
+                );
+              }
+
+              // Check 2: If thread has a suggestion, check if it's been applied.
+              // Scope the match to a small window around the comment's line range to
+              // avoid false positives from common snippets that already exist elsewhere
+              // in the file.
+              let suggestionApplied = false;
+              const suggestions = firstComment.body ? extractSuggestions(firstComment.body) : null;
+              if (suggestions && (commentLine || commentStartLine)) {
+                const fileContent = await getFileContent(filePath);
+                if (fileContent) {
+                  const fileLines = fileContent.split(/\r?\n/);
+                  const cStartIdx = (commentStartLine || commentLine) - 1;
+                  const cEndIdx = (commentLine || commentStartLine) - 1;
+                  const windowPadding = 10;
+                  const windowStart = Math.max(0, Math.min(cStartIdx, cEndIdx) - windowPadding);
+                  const windowEnd = Math.min(fileLines.length, Math.max(cStartIdx, cEndIdx) + windowPadding + 1);
+                  const windowContent = fileLines.slice(windowStart, windowEnd).join('\n');
+                  const normalizedWindow = normalize(windowContent);
+                  suggestionApplied = suggestions.some(s => {
+                    const trimmed = s.trimEnd();
+                    return trimmed && normalizedWindow.includes(normalize(trimmed));
+                  });
+                }
+              }
+
+              // Resolve if suggestion was applied, or if the thread is outdated AND lines changed.
+              // Require isOutdated for line-overlap resolution to avoid incorrectly dismissing
+              // active review threads whose surrounding code happened to change.
+              if (suggestionApplied || (thread.isOutdated && linesChanged)) {
+                try {
+                  await github.graphql(`
+                    mutation($threadId: ID!) {
+                      resolveReviewThread(input: { threadId: $threadId }) {
+                        thread { isResolved }
+                      }
+                    }
+                  `, { threadId: thread.id });
+                  resolvedCount++;
+                  const reason = suggestionApplied ? 'suggestion applied' : 'outdated + lines changed in diff';
+                  const loc = commentStartLine || commentLine || '?';
+                  console.log(`Resolved thread ${thread.id} (${filePath}:${loc} — ${reason})`);
+                } catch (e) {
+                  console.log(`Failed to resolve thread ${thread.id}: ${e.message}`);
+                }
+              } else {
+                skippedCount++;
+              }
+            }
+
+            console.log(`Auto-resolved ${resolvedCount} stale thread(s), ${skippedCount} still unresolved.`);
+
+      - name: Check for pending Copilot SWE sub-PR
+        if: steps.check-is-sub-pr.outputs.is_sub_pr == 'false'
+        id: check-sub-pr
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          HEAD_BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          # Check if there's an open PR from copilot[bot] targeting this PR's branch
+          OPEN_SUB_PRS=$(gh pr list -R "$REPO" --state open --author "app/copilot" \
+            --base "$HEAD_BRANCH" --json number --jq 'length' 2>/dev/null || echo "0")
+          if [ "$OPEN_SUB_PRS" -gt 0 ]; then
+            echo "Copilot SWE agent has an open sub-PR targeting $HEAD_BRANCH — waiting for it to merge before re-requesting review."
+            echo "pending=true" >> $GITHUB_OUTPUT
+          else
+            echo "No pending Copilot sub-PRs found."
+            echo "pending=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Request Copilot Code Review
+        if: steps.check-is-sub-pr.outputs.is_sub_pr == 'false' && steps.check-sub-pr.outputs.pending != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "Requesting code review from Copilot on PR #$PR_NUMBER..."
+
+          # Step 1: Remove Copilot reviewer (clean slate for re-request)
+          gh pr edit "$PR_NUMBER" -R "$REPO" --remove-reviewer @copilot 2>&1 \
+            || echo "Copilot was not in reviewer list."
+
+          # Step 2: Remove any Codex-related reviewer/assignee to prevent conflicts
+          # The bot login may be "chatgpt-codex-connector[bot]" or similar, so match by substring
+          CODEX_REVIEWERS=$(gh api "repos/$REPO/pulls/$PR_NUMBER/requested_reviewers" \
+            --jq '[.users[]?.login // empty] | map(select(test("codex"; "i"))) | .[]' 2>/dev/null || true)
+          for reviewer in $CODEX_REVIEWERS; do
+            echo "Removing Codex reviewer: $reviewer"
+            gh pr edit "$PR_NUMBER" -R "$REPO" --remove-reviewer "$reviewer" 2>&1 || true
+          done
+
+          CODEX_ASSIGNEES=$(gh api "repos/$REPO/pulls/$PR_NUMBER" \
+            --jq '[.assignees[]?.login // empty] | map(select(test("codex"; "i"))) | .[]' 2>/dev/null || true)
+          for assignee in $CODEX_ASSIGNEES; do
+            echo "Removing Codex assignee: $assignee"
+            gh pr edit "$PR_NUMBER" -R "$REPO" --remove-assignee "$assignee" 2>&1 || true
+          done
+
+          # Step 3: Add Copilot as reviewer (reviewer only — SWE agent is
+          #   assigned later in evaluate-and-fix, after review comments exist)
+          # NOTE: The previous approach used POST /requested_reviewers API with
+          # reviewers[]=copilot, which returned HTTP 201 but never triggered a
+          # review. The requested_reviewers REST API does NOT activate Copilot
+          # code review — it only works for human/team reviewers. The correct
+          # method is gh pr edit --add-reviewer @copilot (gh CLI v2.88.0+).
+          if gh pr edit "$PR_NUMBER" -R "$REPO" --add-reviewer @copilot 2>&1; then
+            echo "Successfully requested Copilot code review."
+          else
+            echo "::error::Could not request Copilot code review."
+            echo "  Possible causes:"
+            echo "  - Copilot code review is not enabled in repository rulesets"
+            echo "  - Account does not have Copilot Business/Enterprise/Pro+"
+            echo "  - COPILOT_PAT lacks sufficient permissions"
+            echo "  - gh CLI version does not support --add-reviewer @copilot"
+            echo "  To enable: Repository Settings > Rules > Rulesets > 'Automatically request Copilot code review'"
+          fi
+
+          # Step 4: Verify reviewer was added, retry once if not found
+          sleep 5
+          REVIEWER_ADDED=$(gh api "repos/$REPO/pulls/$PR_NUMBER/requested_reviewers" \
+            --jq '[.users[]?.login // empty, .teams[]?.slug // empty] | map(select(test("copilot"; "i"))) | length' \
+            2>/dev/null || echo "0")
+          if [ "$REVIEWER_ADDED" -eq 0 ]; then
+            echo "::warning::Copilot not found in requested reviewers — retrying..."
+            gh pr edit "$PR_NUMBER" -R "$REPO" --remove-reviewer @copilot 2>&1 || true
+            sleep 3
+            gh pr edit "$PR_NUMBER" -R "$REPO" --add-reviewer @copilot 2>&1 \
+              || echo "::error::Retry failed — Copilot could not be added as reviewer."
+          else
+            echo "Verified: Copilot is in the requested reviewers list."
+          fi
+
+  # ==========================================================
+  # DEBUG: Log gate conditions for evaluate-and-fix
+  # Runs on ALL pull_request_review events so we can see
+  # exactly which condition caused the main job to be skipped.
+  # ==========================================================
+  debug-review-event:
+    name: Debug Review Gate Conditions
+    if: >
+      github.event_name == 'pull_request_review'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Log evaluate-and-fix gate conditions
+        run: |
+          echo "=== evaluate-and-fix job gate conditions ==="
+          echo ""
+          echo "Condition 1: event_name == 'pull_request_review'"
+          echo "  Value: '${{ github.event_name }}'"
+          echo "  Result: ${{ github.event_name == 'pull_request_review' }}"
+          echo ""
+          echo "Condition 2: head.repo.full_name == github.repository"
+          echo "  head.repo.full_name: '${{ github.event.pull_request.head.repo.full_name }}'"
+          echo "  github.repository:   '${{ github.repository }}'"
+          echo "  Result: ${{ github.event.pull_request.head.repo.full_name == github.repository }}"
+          echo ""
+          echo "Condition 3: review.user.login == 'Copilot'"
+          echo "  Value: '${{ github.event.review.user.login }}'"
+          echo "  Result: ${{ github.event.review.user.login == 'Copilot' }}"
+          echo ""
+          echo "Condition 4: review.state != 'approved'"
+          echo "  Value: '${{ github.event.review.state }}'"
+          echo "  Result: ${{ github.event.review.state != 'approved' }}"
+          echo ""
+          echo "Condition 5: review.commit_id == pull_request.head.sha"
+          echo "  review.commit_id:          '${{ github.event.review.commit_id }}'"
+          echo "  pull_request.head.sha:     '${{ github.event.pull_request.head.sha }}'"
+          echo "  Result: ${{ github.event.review.commit_id == github.event.pull_request.head.sha }}"
+          echo ""
+          echo "Condition 6: PR is not a copilot[bot] sub-PR"
+          echo "  pull_request.user.login: '${{ github.event.pull_request.user.login }}'"
+          echo "  pull_request.base.ref:   '${{ github.event.pull_request.base.ref }}'"
+          echo "  default_branch:          '${{ github.event.repository.default_branch }}'"
+          IS_SUB_PR="${{ github.event.pull_request.user.login == 'copilot[bot]' && github.event.pull_request.base.ref != github.event.repository.default_branch }}"
+          echo "  Is sub-PR: $IS_SUB_PR"
+          echo "  Result (not sub-PR): ${{ !(github.event.pull_request.user.login == 'copilot[bot]' && github.event.pull_request.base.ref != github.event.repository.default_branch) }}"
+          echo ""
+          ALL_PASS="${{ github.event_name == 'pull_request_review' && github.event.pull_request.head.repo.full_name == github.repository && github.event.review.user.login == 'Copilot' && github.event.review.state != 'approved' && github.event.review.commit_id == github.event.pull_request.head.sha && !(github.event.pull_request.user.login == 'copilot[bot]' && github.event.pull_request.base.ref != github.event.repository.default_branch) }}"
+          echo "All conditions pass (evaluate-and-fix will run): $ALL_PASS"
+          if [ "$ALL_PASS" != "true" ]; then
+            echo "::warning::evaluate-and-fix job will be SKIPPED — see condition values above."
+          fi
+
+  # ==========================================================
+  # PHASE 2: Evaluate Review & Trigger SWE Agent
+  # Runs ONLY when Copilot submits a review (event-driven).
+  # ==========================================================
+  evaluate-and-fix:
+    name: Evaluate Review & Trigger SWE Agent
+    if: >
+      github.event_name == 'pull_request_review' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.review.user.login == 'Copilot' &&
+      github.event.review.state != 'approved' &&
+      github.event.review.commit_id == github.event.pull_request.head.sha
+    runs-on: ubuntu-latest
+    concurrency:
+      group: copilot-fix-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    steps:
+      - name: Check if this PR is a sub-PR
+        id: check-is-sub-pr
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          REPO: ${{ github.repository }}
+          BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          # A sub-PR's base branch is the head branch of another open PR (the parent)
+          PARENT_PR=$(gh pr list -R "$REPO" --state open \
+            --head "$BASE_REF" --base "$DEFAULT_BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
+          if [ -n "$PARENT_PR" ] && [ "$PARENT_PR" != "null" ]; then
+            echo "This PR is a sub-PR — base branch '$BASE_REF' is the head of parent PR #$PARENT_PR. Skipping evaluate-and-fix."
+            echo "is_sub_pr=true" >> $GITHUB_OUTPUT
+          else
+            echo "Not a sub-PR."
+            echo "is_sub_pr=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check if review was already processed
+        if: steps.check-is-sub-pr.outputs.is_sub_pr == 'false'
+        id: dedup
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          REVIEW_URL: ${{ github.event.review.html_url }}
+        run: |
+          # If the polling path already processed this review, it will have
+          # posted a PR comment containing the review URL. Check for that.
+          ALREADY_PROCESSED=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            | jq -s "flatten | map(select(.body | contains(\"$REVIEW_URL\"))) | length")
+          if [ "$ALREADY_PROCESSED" -gt 0 ]; then
+            echo "Review already processed by polling fallback — skipping."
+            echo "skip=true" >> $GITHUB_OUTPUT
+          else
+            echo "skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Check Recursive Loop Limit (Circuit Breaker)
+        id: loop-limit
+        if: steps.dedup.outputs.skip == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+          MAX_LOOPS: "100"
+        run: |
+          MAGIC_PHRASE="The Copilot Code Reviewer found issues"
+          INVOCATIONS=$(gh api --paginate "repos/$REPO/issues/$PR_NUMBER/comments" \
+            | jq -s "flatten | map(select(.body | contains(\"$MAGIC_PHRASE\"))) | length")
+
+          echo "Current AI loop iterations: $INVOCATIONS / $MAX_LOOPS"
+
+          if [ "$INVOCATIONS" -ge "$MAX_LOOPS" ]; then
+            echo "Maximum AI iteration limit reached ($MAX_LOOPS)."
+            gh pr comment "$PR_NUMBER" -R "$REPO" --body \
+              "⚠️ **Auto-fix loop stopped**: Reached the maximum limit of $MAX_LOOPS automated recursive fixes. Human intervention is now required."
+            echo "stop=true" >> $GITHUB_OUTPUT
+          else
+            echo "stop=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Analyze Review Comments
+        id: analyze
+        if: steps.dedup.outputs.skip == 'false' && steps.loop-limit.outputs.stop == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REVIEW_ID: ${{ github.event.review.id }}
+          REVIEW_STATE: ${{ github.event.review.state }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "::group::Analyze step diagnostic values"
+
+          # Count line-specific comments attached to this review
+          COMMENT_COUNT=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID/comments" \
+            | jq -s 'flatten | length')
+
+          echo "REVIEW_ID: $REVIEW_ID"
+          echo "COMMENT_COUNT: $COMMENT_COUNT"
+
+          # Check if the review body appears actionable
+          REVIEW_BODY=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$REVIEW_ID" | jq -r '.body // ""')
+          REVIEW_STATE_NORM=$(printf "%s" "$REVIEW_STATE" | tr '[:upper:]' '[:lower:]')
+          BODY_NORM=$(printf "%s" "$REVIEW_BODY" | tr '[:upper:]' '[:lower:]')
+
+          echo "REVIEW_STATE (raw): $REVIEW_STATE"
+          echo "REVIEW_STATE (normalized): $REVIEW_STATE_NORM"
+          echo "REVIEW_BODY length: ${#REVIEW_BODY}"
+          echo "REVIEW_BODY (first 200 chars): ${REVIEW_BODY:0:200}"
+
+          # Detect "can't review" response
+          if printf "%s" "$BODY_NORM" | grep -Eq "wasn.t able to review|unable to review|could not review|can.t review"; then
+            echo "::warning::Copilot code reviewer could not review the files in this PR."
+            echo "::endgroup::"
+            echo "has_issues=false" >> $GITHUB_OUTPUT
+            gh pr comment "$PR_NUMBER" -R "$REPO" --body \
+              "**Copilot review skipped.** Copilot wasn't able to review the files in this PR." \
+              || true
+            exit 0
+          fi
+
+          echo "Can't-review detection: passed (no match)"
+
+          BODY_TEXT=$(printf "%s" "$BODY_NORM" | tr -d '[:space:]')
+          BODY_CANON=$(printf "%s" "$BODY_NORM" | tr -cd '[:alnum:]')
+          HAS_ACTIONABLE_BODY="false"
+
+          if [ -n "$BODY_TEXT" ]; then
+            BODY_FILTERED=$(printf "%s" "$BODY_NORM" | sed -E 's/\<no issues?\>//g; s/\<no issues? found\>//g')
+            if printf "%s" "$BODY_FILTERED" | grep -Eq '```suggestion|changes requested|issue|bug|error|fix|must|should|needs? to|please (fix|change|update)|recommend|blocking'; then
+              case "$BODY_CANON" in
+                great|greatwork|nicework|goodwork|goodjob|lgtm|looksgood|shipit)
+                  HAS_ACTIONABLE_BODY="false"
+                  ;;
+                *)
+                  HAS_ACTIONABLE_BODY="true"
+                  ;;
+              esac
+            fi
+          fi
+
+          echo "BODY_TEXT empty: $([ -z "$BODY_TEXT" ] && echo 'yes' || echo 'no')"
+          echo "BODY_CANON: ${BODY_CANON:0:100}"
+          echo "HAS_ACTIONABLE_BODY: $HAS_ACTIONABLE_BODY"
+          echo "::endgroup::"
+
+          echo "Copilot left $COMMENT_COUNT line comments (state: $REVIEW_STATE_NORM, actionable_body: $HAS_ACTIONABLE_BODY)."
+
+          if [ "$COMMENT_COUNT" -gt 0 ] || [ "$REVIEW_STATE_NORM" == "changes_requested" ] || { [ "$REVIEW_STATE_NORM" == "commented" ] && [ "$HAS_ACTIONABLE_BODY" == "true" ]; }; then
+            echo "Issues detected."
+            echo "has_issues=true" >> $GITHUB_OUTPUT
+          else
+            echo "No actionable issues detected."
+            echo "has_issues=false" >> $GITHUB_OUTPUT
+            gh pr comment "$PR_NUMBER" -R "$REPO" --body \
+              "**Auto-fix loop complete!** The Copilot Code Reviewer found no further actionable issues."
+          fi
+
+      - name: Auto-resolve threads with applied suggestions
+        if: steps.dedup.outputs.skip == 'false' && steps.loop-limit.outputs.stop == 'false' && steps.analyze.outputs.has_issues == 'true'
+        uses: actions/github-script@v7
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+        with:
+          github-token: ${{ secrets.COPILOT_PAT }}
+          script: |
+            const prNumber = parseInt('${{ github.event.pull_request.number }}', 10);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const headSha = '${{ github.event.pull_request.head.sha }}';
+
+            // ──────────────────────────────────────────────────────────
+            // 1. Fetch all unresolved review threads (paginated GraphQL)
+            // ──────────────────────────────────────────────────────────
+            let allThreads = [];
+            let hasNextPage = true;
+            let cursor = null;
+
+            while (hasNextPage) {
+              const afterClause = cursor ? `, after: "${cursor}"` : '';
+              const query = `
+                query($owner: String!, $repo: String!, $prNumber: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $prNumber) {
+                      reviewThreads(first: 100${afterClause}) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes {
+                          id
+                          isResolved
+                          isOutdated
+                          comments(first: 100) {
+                            nodes { id, body, path, line, startLine }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+              const result = await github.graphql(query, { owner, repo, prNumber });
+              const threads = result.repository.pullRequest.reviewThreads;
+              allThreads.push(...threads.nodes);
+              hasNextPage = threads.pageInfo.hasNextPage;
+              cursor = threads.pageInfo.endCursor;
+            }
+
+            const unresolvedThreads = allThreads.filter(t => !t.isResolved);
+            console.log(`Found ${unresolvedThreads.length} unresolved thread(s) to check.`);
+
+            if (unresolvedThreads.length === 0) return;
+
+            // ──────────────────────────────────────────────────────────
+            // 2. Helpers
+            // ──────────────────────────────────────────────────────────
+            const suggestionRegex = /```suggestion\s*\n([\s\S]*?)```/g;
+
+            function extractSuggestions(body) {
+              const suggestions = [];
+              let match;
+              while ((match = suggestionRegex.exec(body)) !== null) {
+                suggestions.push(match[1]);
+              }
+              suggestionRegex.lastIndex = 0;
+              return suggestions.length > 0 ? suggestions : null;
+            }
+
+            function normalize(str) {
+              return str.replace(/[ \t]+$/gm, '').replace(/\r\n/g, '\n').trimEnd();
+            }
+
+            const fileCache = new Map();
+
+            async function getFileContent(filePath) {
+              if (fileCache.has(filePath)) return fileCache.get(filePath);
+              try {
+                const { data } = await github.rest.repos.getContent({
+                  owner, repo, path: filePath, ref: headSha,
+                });
+                const content = Buffer.from(data.content, 'base64').toString('utf-8');
+                fileCache.set(filePath, content);
+                return content;
+              } catch (e) {
+                fileCache.set(filePath, null);
+                return null;
+              }
+            }
+
+            // ──────────────────────────────────────────────────────────
+            // 3. Check each unresolved thread and resolve if applied
+            // ──────────────────────────────────────────────────────────
+            let resolvedCount = 0;
+            let skippedNoSuggestion = 0;
+            let skippedNoFile = 0;
+            let checkedCount = 0;
+
+            for (const thread of unresolvedThreads) {
+              const firstComment = thread.comments.nodes[0];
+              if (!firstComment || !firstComment.body || !firstComment.path) continue;
+
+              const suggestions = extractSuggestions(firstComment.body);
+              if (!suggestions) {
+                skippedNoSuggestion++;
+                continue;
+              }
+
+              checkedCount++;
+              const fileContent = await getFileContent(firstComment.path);
+              if (!fileContent) {
+                skippedNoFile++;
+                console.log(`Skipped thread ${thread.id}: file ${firstComment.path} not found at HEAD.`);
+                continue;
+              }
+
+              const normalizedFile = normalize(fileContent);
+
+              const matched = suggestions.some(suggestion => {
+                const trimmed = suggestion.trimEnd();
+                if (!trimmed) return false;
+                return normalizedFile.includes(normalize(trimmed));
+              });
+
+              if (matched) {
+                try {
+                  await github.graphql(`
+                    mutation($threadId: ID!) {
+                      resolveReviewThread(input: { threadId: $threadId }) {
+                        thread { isResolved }
+                      }
+                    }
+                  `, { threadId: thread.id });
+                  resolvedCount++;
+                  const loc = firstComment.startLine || firstComment.line || '?';
+                  console.log(`Resolved thread ${thread.id} (${firstComment.path}:${loc} — suggestion found in file)`);
+                } catch (e) {
+                  console.log(`Failed to resolve thread ${thread.id}: ${e.message}`);
+                }
+              } else {
+                const loc = firstComment.startLine || firstComment.line || 'outdated';
+                console.log(`Thread ${thread.id} NOT matched (${firstComment.path}:${loc})`);
+              }
+            }
+
+            console.log(`Auto-resolved ${resolvedCount} of ${unresolvedThreads.length} unresolved thread(s) (checked: ${checkedCount}, skipped: ${skippedNoSuggestion} free-text, ${skippedNoFile} missing files).`);
+
+      - name: Collect unresolved comments and call Copilot SWE Agent
+        if: steps.dedup.outputs.skip == 'false' && steps.loop-limit.outputs.stop == 'false' && steps.analyze.outputs.has_issues == 'true'
+        uses: actions/github-script@v7
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          REVIEW_ID: ${{ github.event.review.id }}
+          REVIEW_URL: ${{ github.event.review.html_url }}
+        with:
+          github-token: ${{ secrets.COPILOT_PAT }}
+          script: |
+            const prNumber = parseInt('${{ github.event.pull_request.number }}', 10);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            // ──────────────────────────────────────────────────────────
+            // 1. Collect ALL unresolved review threads (paginated GraphQL)
+            // ──────────────────────────────────────────────────────────
+            let allThreads = [];
+            let hasNextPage = true;
+            let cursor = null;
+
+            while (hasNextPage) {
+              const afterClause = cursor ? `, after: "${cursor}"` : '';
+              const query = `
+                query($owner: String!, $repo: String!, $prNumber: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $prNumber) {
+                      reviewThreads(first: 100${afterClause}) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes {
+                          id
+                          isResolved
+                          isOutdated
+                          comments(first: 100) {
+                            nodes {
+                              id
+                              body
+                              path
+                              line
+                              startLine
+                              author { login }
+                              diffHunk
+                              createdAt
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              `;
+              const result = await github.graphql(query, { owner, repo, prNumber });
+              const threads = result.repository.pullRequest.reviewThreads;
+              allThreads.push(...threads.nodes);
+              hasNextPage = threads.pageInfo.hasNextPage;
+              cursor = threads.pageInfo.endCursor;
+            }
+
+            const unresolvedThreads = allThreads.filter(t => !t.isResolved);
+
+            // ──────────────────────────────────────────────────────────
+            // 2. Also fetch ALL review comments via REST as fallback
+            //    for orphaned comments not in any GraphQL thread
+            // ──────────────────────────────────────────────────────────
+            const allReviewComments = await github.paginate(
+              github.rest.pulls.listReviewComments, {
+                owner, repo,
+                pull_number: prNumber,
+                per_page: 100,
+              }
+            );
+
+            const threadCommentIds = new Set();
+            for (const t of allThreads) {
+              for (const c of t.comments.nodes) {
+                if (c.id) threadCommentIds.add(c.id);
+              }
+            }
+
+            const orphanedComments = allReviewComments.filter(
+              c => !threadCommentIds.has(c.node_id)
+            );
+
+            // ──────────────────────────────────────────────────────────
+            // 3. Build a detailed fix list for the SWE agent
+            // ──────────────────────────────────────────────────────────
+            const fixItems = [];
+            const processedIds = new Set();
+
+            for (const thread of unresolvedThreads) {
+              for (const comment of thread.comments.nodes) {
+                if (!comment.body || !comment.path) continue;
+                if (processedIds.has(comment.id)) continue;
+                processedIds.add(comment.id);
+
+                const startLine = comment.startLine || comment.line || '?';
+                const endLine = comment.line || '?';
+                const location = startLine === endLine
+                  ? `line ${endLine}`
+                  : `lines ${startLine}–${endLine}`;
+
+                fixItems.push(
+                  `### ${comment.path} (${location})\n` +
+                  `**Author:** ${comment.author?.login || 'unknown'}\n\n` +
+                  `${comment.body}`
+                );
+              }
+            }
+
+            for (const rc of orphanedComments) {
+              if (processedIds.has(rc.node_id)) continue;
+              processedIds.add(rc.node_id);
+
+              const line = rc.line || rc.original_line || '?';
+              const startLine = rc.start_line || rc.original_start_line || line;
+              const location = startLine === line
+                ? `line ${line}`
+                : `lines ${startLine}–${line}`;
+
+              fixItems.push(
+                `### ${rc.path} (${location})\n` +
+                `**Author:** ${rc.user?.login || 'unknown'}\n\n` +
+                `${rc.body}`
+              );
+            }
+
+            console.log(`Collected ${fixItems.length} unresolved comment(s) across ${unresolvedThreads.length} thread(s) and ${orphanedComments.length} orphaned comment(s).`);
+
+            if (fixItems.length === 0) {
+              // No inline threads; check review body as fallback
+              const reviewId = parseInt(process.env.REVIEW_ID, 10);
+              console.log(`Attempting review body fallback. REVIEW_ID env: '${process.env.REVIEW_ID}', parsed: ${reviewId}`);
+              if (!isNaN(reviewId)) {
+                const { data: review } = await github.rest.pulls.getReview({
+                  owner, repo, pull_number: prNumber, review_id: reviewId,
+                });
+                if (review.body) {
+                  fixItems.push(
+                    `### Review body feedback\n` +
+                    `**Author:** ${review.user?.login || 'unknown'}\n\n` +
+                    `${review.body}`
+                  );
+                  console.log('No inline threads — using top-level review body as fix item.');
+                }
+              } else {
+                console.log(`::warning::REVIEW_ID is not a valid number (raw value: '${process.env.REVIEW_ID}') — cannot fetch review body as fallback.`);
+              }
+              if (fixItems.length === 0) {
+                console.log('No actionable comments found — all resolved.');
+                // Clean up task section from PR body if present
+                const { data: cleanPr } = await github.rest.pulls.get({ owner, repo, pull_number: prNumber });
+                const cleanBody = cleanPr.body || '';
+                const cleanStart = cleanBody.indexOf('<!-- copilot-tasks-start -->');
+                const cleanEnd = cleanBody.indexOf('<!-- copilot-tasks-end -->');
+                if (cleanStart !== -1 && cleanEnd !== -1) {
+                  const updatedBody = cleanBody.substring(0, cleanStart) + cleanBody.substring(cleanEnd + '<!-- copilot-tasks-end -->'.length);
+                  await github.rest.pulls.update({ owner, repo, pull_number: prNumber, body: updatedBody.trim() });
+                  console.log('Removed task section from PR body (all comments resolved).');
+                }
+                return;
+              }
+            }
+
+            // ──────────────────────────────────────────────────────────
+            // 4. Update PR body with task section
+            // ──────────────────────────────────────────────────────────
+            const { data: prData } = await github.rest.pulls.get({
+              owner, repo, pull_number: prNumber,
+            });
+            const branchName = prData.head.ref;
+
+            const taskSection = [
+              '<!-- copilot-tasks-start -->',
+              '## Pending Review Tasks',
+              '',
+              '> Auto-generated by the review-fix loop. Copilot has been assigned to apply these fixes.',
+              '',
+              `There are **${fixItems.length}** unresolved review thread(s) to address:`,
+              '',
+              '**For each thread with a \\`\\`\\`suggestion\\`\\`\\` block:** apply the suggested code replacement at the exact file and line shown.',
+              '**For each free-text comment:** open the file at the path/line shown, implement the requested change, and push commits to this branch.',
+              '',
+              fixItems.join('\n\n---\n\n'),
+              '',
+              'Run validation before committing:',
+              '',
+              '```bash',
+              'npm run lint',
+              'npm test',
+              'npm run build',
+              '```',
+              '',
+              `Push fixes directly to branch \`${branchName}\`. Do NOT open a new pull request.`,
+              '<!-- copilot-tasks-end -->',
+            ].join('\n');
+
+            const currentBody = prData.body || '';
+            const startTag = '<!-- copilot-tasks-start -->';
+            const endTag = '<!-- copilot-tasks-end -->';
+            const startIdx = currentBody.indexOf(startTag);
+            const endIdx = currentBody.indexOf(endTag);
+            let newBody;
+            if (startIdx !== -1 && endIdx !== -1) {
+              newBody = currentBody.substring(0, startIdx) + taskSection + currentBody.substring(endIdx + endTag.length);
+            } else {
+              newBody = currentBody + '\n\n' + taskSection;
+            }
+            await github.rest.pulls.update({ owner, repo, pull_number: prNumber, body: newBody });
+            console.log(`Updated PR #${prNumber} body with ${fixItems.length} pending review tasks.`);
+
+            // ──────────────────────────────────────────────────────────
+            // 5. Call @copilot via PR comment to wake the SWE agent
+            //    CRITICAL: Uses COPILOT_PAT via github-token —
+            //    GITHUB_TOKEN mentions are ignored by native bots.
+            // ──────────────────────────────────────────────────────────
+            const reviewUrl = process.env.REVIEW_URL;
+            const commentResult = await github.rest.issues.createComment({
+              owner, repo,
+              issue_number: prNumber,
+              body: `The Copilot Code Reviewer found issues with the latest code.\n\n` +
+                `@copilot Please review the feedback here: ${reviewUrl}, ` +
+                `address all ${fixItems.length} unresolved review comment(s), ` +
+                `and push the fixes to this branch.`,
+            });
+            console.log(`Mentioned @copilot on PR #${prNumber} (comment id: ${commentResult.data.id}, url: ${commentResult.data.html_url})`);
+
+      - name: Debug — Verify Copilot SWE Agent Activation
+        if: steps.dedup.outputs.skip == 'false' && steps.loop-limit.outputs.stop == 'false' && steps.analyze.outputs.has_issues == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          echo "=== DEBUG: Checking if Copilot SWE agent activated after @copilot mention ==="
+
+          # 1. Verify the @copilot comment exists
+          echo "--- Recent @copilot comments ---"
+          gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '[.[] | select(.body | test("@copilot"))] | .[-1] | "Comment #\(.id) by \(.user.login) at \(.created_at):\n\(.body[:120])..."' \
+            2>/dev/null || echo "No @copilot comments found"
+
+          # 2. Check reactions on the latest @copilot comment
+          COMMENT_ID=$(gh api "repos/$REPO/issues/$PR_NUMBER/comments" \
+            --jq '[.[] | select(.body | test("@copilot"))] | .[-1].id' 2>/dev/null || echo "")
+          if [ -n "$COMMENT_ID" ] && [ "$COMMENT_ID" != "null" ]; then
+            echo "--- Reactions on comment #$COMMENT_ID ---"
+            gh api "repos/$REPO/issues/comments/$COMMENT_ID/reactions" \
+              --jq '.[] | "\(.user.login): \(.content)"' 2>/dev/null || echo "(no reactions)"
+          fi
+
+          # 3. Check PR assignees
+          echo "--- Current PR assignees ---"
+          gh api "repos/$REPO/pulls/$PR_NUMBER" \
+            --jq '[.assignees[]?.login // empty] | if length == 0 then "(none)" else join(", ") end' \
+            2>/dev/null || echo "(error)"
+
+          # 4. Wait 60s then check for SWE agent activity
+          echo "--- Waiting 60s to check for SWE agent activation ---"
+          sleep 60
+
+          # 5. Check timeline for any copilot events after our comment
+          echo "--- Copilot-related timeline events ---"
+          gh api --paginate "repos/$REPO/issues/$PR_NUMBER/timeline" \
+            --jq '.[] | select(
+              (.user?.login? // .actor?.login? // "" | test("copilot"; "i")) or
+              (.event? // "" | test("assigned|committed"))
+            ) | "\(.event // .type // "comment") by \(.user?.login? // .actor?.login? // "unknown") at \(.created_at // .submitted_at // "?"): \(.body? // .message? // "" | .[0:80])"' \
+            2>/dev/null || echo "(no copilot timeline events)"
+
+          # 6. Check if any new sub-PRs were created by copilot
+          echo "--- Sub-PRs by copilot ---"
+          HEAD_BRANCH=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.head.ref' 2>/dev/null)
+          gh pr list -R "$REPO" --state open --json number,author,headRefName,baseRefName \
+            --jq ".[] | select(.baseRefName == \"$HEAD_BRANCH\" or (.author.login | test(\"copilot\"; \"i\"))) | \"PR #\(.number) by \(.author.login): \(.headRefName) -> \(.baseRefName)\"" \
+            2>/dev/null || echo "(none)"
+
+          echo "=== DEBUG END ==="
+
+  # ==========================================================
+  # AUTO-MERGE: DISABLED — sub-PR merging is handled by the
+  # dedicated sub-pr-auto-merge.yml workflow instead.
+  # Kept commented out for reference.
+  # ==========================================================
+  # auto-merge-sub-pr:
+  #   name: Auto-merge Copilot Sub-PR
+  #   if: >
+  #     github.event_name == 'pull_request' &&
+  #     (github.event.action == 'opened' || github.event.action == 'reopened') &&
+  #     contains(github.event.pull_request.user.login, 'copilot') &&
+  #     github.event.pull_request.base.ref != github.event.repository.default_branch
+  #   runs-on: ubuntu-latest
+  #   concurrency:
+  #     group: copilot-automerge-${{ github.event.pull_request.number }}
+  #     cancel-in-progress: false
+  #   steps:
+  #     - name: Verify this is a sub-PR with a parent PR
+  #       id: verify-parent
+  #       env:
+  #         GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+  #         REPO: ${{ github.repository }}
+  #         BASE_REF: ${{ github.event.pull_request.base.ref }}
+  #       run: |
+  #         PARENT_PR=$(gh pr list -R "$REPO" --state open \
+  #           --head "$BASE_REF" --json number --jq '.[0].number' 2>/dev/null || echo "")
+  #         if [ -n "$PARENT_PR" ] && [ "$PARENT_PR" != "null" ]; then
+  #           echo "Confirmed: parent PR #$PARENT_PR found for base branch '$BASE_REF'."
+  #           echo "has_parent=true" >> $GITHUB_OUTPUT
+  #           echo "parent_number=$PARENT_PR" >> $GITHUB_OUTPUT
+  #         else
+  #           echo "::warning::No parent PR found for base branch '$BASE_REF'. Skipping auto-merge."
+  #           echo "has_parent=false" >> $GITHUB_OUTPUT
+  #         fi
+  #
+  #     - name: Remove Copilot reviewer from sub-PR
+  #       if: steps.verify-parent.outputs.has_parent == 'true'
+  #       env:
+  #         GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+  #         PR_NUMBER: ${{ github.event.pull_request.number }}
+  #         REPO: ${{ github.repository }}
+  #       run: |
+  #         echo "Removing Copilot as reviewer from sub-PR #$PR_NUMBER (review is redundant)..."
+  #         gh pr edit "$PR_NUMBER" -R "$REPO" --remove-reviewer @copilot 2>/dev/null \
+  #           || echo "Note: Could not remove Copilot reviewer (may not have been added yet)."
+  #
+  #     - name: Wait for Copilot SWE agent to finish work
+  #       if: steps.verify-parent.outputs.has_parent == 'true'
+  #       id: wait-for-finish
+  #       env:
+  #         GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+  #         PR_NUMBER: ${{ github.event.pull_request.number }}
+  #         REPO: ${{ github.repository }}
+  #       run: |
+  #         POLL_INTERVAL=30
+  #         MAX_WAIT=900
+  #         ELAPSED=0
+  #         FOUND_FINISHED=false
+  #         echo "Waiting for Copilot SWE agent to finish work on sub-PR #$PR_NUMBER..."
+  #         while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
+  #           # Detect agent completion by checking if it requested a review from
+  #           # a human user (.type == "User"). DO NOT revert to "finished work"
+  #           # text polling (see commit c04dc8f).
+  #           REVIEW_REQUESTED=$(gh api "repos/$REPO/pulls/$PR_NUMBER/requested_reviewers" \
+  #             2>/dev/null | jq \
+  #             '[.users[]? | select(.type == "User")] | length' \
+  #             || echo "0")
+  #           if [ "$REVIEW_REQUESTED" -gt 0 ]; then
+  #             echo "Copilot SWE agent has finished work on sub-PR #$PR_NUMBER (detected via review request for a human user)."
+  #             FOUND_FINISHED=true
+  #             break
+  #           fi
+  #           gh pr edit "$PR_NUMBER" -R "$REPO" --remove-reviewer @copilot 2>/dev/null || true
+  #           COPILOT_REVIEWS=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+  #             --jq '[.[] | select(.user.login == "Copilot" and .state != "DISMISSED")] | .[].id' 2>/dev/null || true)
+  #           for RID in $COPILOT_REVIEWS; do
+  #             gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$RID/dismissals" \
+  #               --method PUT --field 'message=Auto-dismissed: sub-PR does not need Copilot review.' 2>/dev/null || true
+  #           done
+  #           echo "Agent still working (${ELAPSED}s / ${MAX_WAIT}s)..."
+  #           sleep "$POLL_INTERVAL"
+  #           ELAPSED=$((ELAPSED + POLL_INTERVAL))
+  #         done
+  #         if [ "$FOUND_FINISHED" = "true" ]; then
+  #           echo "finished=true" >> $GITHUB_OUTPUT
+  #         else
+  #           echo "::warning::Timed out waiting for SWE agent to finish after ${MAX_WAIT}s."
+  #           echo "finished=false" >> $GITHUB_OUTPUT
+  #         fi
+  #
+  #     - name: Auto-merge sub-PR
+  #       if: steps.verify-parent.outputs.has_parent == 'true' && steps.wait-for-finish.outputs.finished == 'true'
+  #       env:
+  #         GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+  #         PR_NUMBER: ${{ github.event.pull_request.number }}
+  #         REPO: ${{ github.repository }}
+  #         BASE_REF: ${{ github.event.pull_request.base.ref }}
+  #       run: |
+  #         echo "Auto-merging Copilot sub-PR #$PR_NUMBER into $BASE_REF..."
+  #         IS_DRAFT=$(gh api "repos/$REPO/pulls/$PR_NUMBER" --jq '.draft')
+  #         if [ "$IS_DRAFT" = "true" ]; then
+  #           gh pr ready "$PR_NUMBER" -R "$REPO" \
+  #             || echo "::warning::Could not mark sub-PR as ready."
+  #         fi
+  #         gh pr edit "$PR_NUMBER" -R "$REPO" --remove-reviewer @copilot 2>/dev/null || true
+  #         dismiss_copilot_reviews() {
+  #           COPILOT_REVIEWS=$(gh api --paginate "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+  #             --jq '[.[] | select(.user.login == "Copilot" and (.state == "CHANGES_REQUESTED" or .state == "COMMENTED"))] | .[].id' \
+  #             2>/dev/null || true)
+  #           for RID in $COPILOT_REVIEWS; do
+  #             echo "Dismissing Copilot review $RID before merge..."
+  #             gh api "repos/$REPO/pulls/$PR_NUMBER/reviews/$RID/dismissals" \
+  #               --method PUT --field 'message=Auto-dismissed for sub-PR auto-merge.' 2>/dev/null || true
+  #           done
+  #         }
+  #         dismiss_copilot_reviews
+  #         gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+  #           --method POST \
+  #           --field 'event=APPROVE' \
+  #           --field 'body=Auto-approved: Copilot SWE agent sub-PR merged by automation.' \
+  #           2>/dev/null || echo "::warning::Could not approve sub-PR."
+  #         MAX_RETRIES=3
+  #         RETRY=0
+  #         MERGED=false
+  #         while [ "$RETRY" -lt "$MAX_RETRIES" ]; do
+  #           if gh pr merge "$PR_NUMBER" -R "$REPO" --merge; then
+  #             echo "Successfully merged sub-PR #$PR_NUMBER into $BASE_REF."
+  #             MERGED=true
+  #             break
+  #           fi
+  #           RETRY=$((RETRY + 1))
+  #           echo "Merge attempt $RETRY/$MAX_RETRIES failed — retrying in 10s..."
+  #           sleep 10
+  #           dismiss_copilot_reviews
+  #         done
+  #         if [ "$MERGED" != "true" ]; then
+  #           echo "::error::Failed to merge sub-PR #$PR_NUMBER after $MAX_RETRIES attempts."
+  #         fi

@@ -1,0 +1,179 @@
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+    types: [opened, synchronize, reopened, labeled]
+
+jobs:
+  lint-and-typecheck:
+    name: Lint & Type Check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Type check
+        run: npm run typecheck
+
+  test:
+    name: Unit Tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Run unit tests
+        run: npm test
+
+  security:
+    name: Security Audit & Auto-Fix
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.COPILOT_PAT || github.token }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Iterative security audit and fix
+        run: |
+          MAX_ATTEMPTS=3
+          AUDIT_CLEAN=false
+
+          for i in $(seq 1 $MAX_ATTEMPTS); do
+            echo "========================================="
+            echo "Attempt $i of $MAX_ATTEMPTS"
+            echo "========================================="
+
+            if npm audit --audit-level=high; then
+              echo "Audit passed on attempt $i."
+              AUDIT_CLEAN=true
+              break
+            fi
+
+            echo "Audit failed. Attempting safe fixes (no --force)..."
+            npm audit fix 2>&1 || true
+
+            # Verify the fix didn't break peer dependencies
+            LS_OUTPUT="$(npm ls --depth=0 2>&1 || true)"
+            if echo "$LS_OUTPUT" | grep -qiE "ERESOLVE|peer dep|invalid"; then
+              echo "npm audit fix broke dependencies — rolling back."
+              git checkout -- package.json package-lock.json
+              npm ci
+            else
+              echo "Dependencies still compatible after fix."
+              npm ci
+              npm test || true
+            fi
+          done
+
+          # Commit any changes made during fix attempts
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add package.json package-lock.json
+          if git diff --cached --quiet; then
+            echo "No fixable vulnerabilities found."
+          else
+            git commit -m "security: auto-fix npm audit vulnerabilities"
+            if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+              GITHUB_TOKEN="${{ secrets.COPILOT_PAT }}" bash .github/scripts/push-with-scan-wait.sh
+            else
+              echo "Skipping push on PR event to avoid pushing to fork/protected branch."
+            fi
+          fi
+
+          # Final audit determines the step's exit code
+          npm audit --audit-level=high
+
+  test-coverage-check:
+    name: PR Test Coverage
+    if: >-
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check test coverage for changed files
+        run: bash .github/scripts/check-test-coverage.sh
+
+  build:
+    name: Build & Verify
+    runs-on: ubuntu-latest
+    needs: [lint-and-typecheck, test, security]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - run: npm ci
+
+      - name: Production build
+        run: npm run build
+
+      - name: Build verification tests
+        run: npm run test:build
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          retention-days: 7
+
+  copilot-deployment:
+    name: Copilot Deployment
+    runs-on: ubuntu-latest
+    needs: [build]
+    if: >-
+      github.event_name == 'pull_request' &&
+      contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
+    permissions:
+      deployments: write
+    environment:
+      name: copilot
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download build artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+      - name: Verify build artifact
+        run: |
+          echo "Verifying build artifact..."
+          test -f dist/index.html || { echo "ERROR: dist/index.html not found"; exit 1; }
+          ASSET_COUNT=$(find dist -type f | wc -l)
+          echo "Build artifact contains $ASSET_COUNT files"
+          test "$ASSET_COUNT" -gt 0 || { echo "ERROR: dist/ is empty"; exit 1; }
+          echo "Build artifact verified successfully"
