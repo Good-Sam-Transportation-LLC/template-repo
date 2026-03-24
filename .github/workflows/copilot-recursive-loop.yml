@@ -132,7 +132,7 @@ jobs:
       # paths 2-4, preventing active threads from being silently dismissed.
       - name: Auto-resolve stale review threads after code changes
         if: steps.check-is-sub-pr.outputs.is_sub_pr == 'false'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           GH_TOKEN: ${{ secrets.COPILOT_PAT }}
         with:
@@ -682,7 +682,7 @@ jobs:
       - name: Verify zero unresolved review threads
         if: steps.dedup.outputs.skip == 'false' && steps.loop-limit.outputs.stop == 'false' && steps.analyze.outputs.has_issues == 'false'
         id: verify-clean
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           GH_TOKEN: ${{ secrets.COPILOT_PAT }}
         with:
@@ -809,7 +809,7 @@ jobs:
 
       - name: Auto-resolve threads with applied suggestions
         if: steps.dedup.outputs.skip == 'false' && steps.loop-limit.outputs.stop == 'false' && steps.analyze.outputs.has_issues == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           GH_TOKEN: ${{ secrets.COPILOT_PAT }}
         with:
@@ -955,7 +955,7 @@ jobs:
 
       - name: Collect unresolved comments and call Copilot SWE Agent
         if: steps.dedup.outputs.skip == 'false' && steps.loop-limit.outputs.stop == 'false' && steps.analyze.outputs.has_issues == 'true'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           GH_TOKEN: ${{ secrets.COPILOT_PAT }}
           REVIEW_ID: ${{ github.event.review.id }}

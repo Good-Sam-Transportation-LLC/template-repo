@@ -35,7 +35,7 @@ jobs:
       - name: Check if Copilot SWE loop has reached a terminal state
         if: steps.check-key.outputs.skip == 'false'
         id: check-loop-done
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.COPILOT_PAT }}
           script: |
@@ -156,7 +156,7 @@ jobs:
       - name: Collect unresolved review threads and apply fixes
         if: steps.check-key.outputs.skip == 'false' && steps.check-loop-done.outputs.proceed == 'true'
         id: apply-fixes
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         with:

@@ -136,7 +136,7 @@ jobs:
 
       - name: Get CodeQL alerts
         id: alerts
-        uses: actions/github-script@v7
+        uses: actions/github-script@v8
         with:
           github-token: ${{ secrets.COPILOT_PAT }}
           script: |
