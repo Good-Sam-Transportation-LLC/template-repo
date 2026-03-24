@@ -136,7 +136,7 @@ jobs:
             console.log('No terminal state detected — loop is mid-cycle. Skipping.');
             core.setOutput('proceed', 'false');
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         if: steps.check-key.outputs.skip == 'false' && steps.check-loop-done.outputs.proceed == 'true'
         with:
           ref: ${{ github.event.workflow_run.head_branch }}

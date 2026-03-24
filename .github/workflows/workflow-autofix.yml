@@ -27,7 +27,7 @@ jobs:
           fi
           echo "COPILOT_PAT is available (${#TOKEN} chars)"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           ref: ${{ github.event.workflow_run.head_branch }}
           token: ${{ secrets.COPILOT_PAT }}
