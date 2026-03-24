@@ -371,8 +371,17 @@ This repository uses GitHub Copilot for automated code review and issue resoluti
 - Assign issues to `@copilot` to trigger automated fixes
 - Agent runs in a pre-configured environment with Node 20, npm, lint, and tests
 
+### Auto-Approve on Clean Review
+- When the review loop completes with zero issues, the workflow:
+  1. Verifies all review threads are resolved (GraphQL)
+  2. Waits for CI checks to pass (up to 10 minutes)
+  3. Approves the PR via `APPROVER_PAT`
+- Add a `skip-auto-approve` label to opt out
+- Satisfies branch protection "required approvals" rule
+
 ### Required Secrets
 - **`COPILOT_PAT`** — Fine-grained PAT with Read & Write access to Pull Requests, Issues, and Contents (required because `GITHUB_TOKEN` cannot wake native bots)
+- **`APPROVER_PAT`** — Fine-grained PAT from a **different** GitHub account, with Read & Write access to Pull Requests (for auto-approval; GitHub blocks self-approval)
 
 ### Setup
 See `.github/COPILOT_SETUP.md` for instructions on enabling these features.
@@ -381,19 +390,18 @@ See `.github/COPILOT_SETUP.md` for instructions on enabling these features.
 
 ## OpenAI Codex CI Integration
 
-OpenAI Codex runs via a dedicated `codex-review` workflow (`.github/workflows/codex-review.yml`) rather than as a job in `ci.yml`.
+The CI pipeline includes a final `codex-review` job that runs OpenAI Codex after all other checks pass.
 
 ### How It Works
-- Trigger: `pull_request_review` (runs when a human submits a review on a pull request)
-- Operates as a separate workflow from `ci.yml` — runs independently of the main CI pipeline
-- Uses `@openai/codex` CLI via `codex exec --dangerously-bypass-approvals-and-sandbox` to review and fix issues on the PR branch
-- The `codex-review` job does **not** use `continue-on-error: true`, so missing or invalid Codex credentials (or CLI failures) will cause the workflow to fail and surface clearly in the PR checks
+- Runs after: lint, typecheck, test, security audit, and build all pass
+- Uses `@openai/codex` CLI with `--dangerously-bypass-approvals-and-sandbox` to review and fix issues
+- `continue-on-error: true` — won't block CI if API key is missing
 
 ### Required Secret
-Add `CODEX_API_KEY` to your repository secrets:
+Add `OPENAI_API_KEY` to your repository secrets:
 1. Go to **Repository Settings** > **Secrets and variables** > **Actions**
 2. Click **New repository secret**
-3. Name: `CODEX_API_KEY`, Value: your Codex API key
+3. Name: `OPENAI_API_KEY`, Value: your OpenAI API key
 
 ---
 

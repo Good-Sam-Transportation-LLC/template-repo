@@ -66,8 +66,8 @@ describe("Copilot recursive loop triggers", () => {
 // Group 3: Permissions
 // ---------------------------------------------------------------------------
 describe("Copilot recursive loop permissions", () => {
-  it("has contents: read permission", () => {
-    expect(workflow.permissions.contents).toBe("read");
+  it("has contents: write permission", () => {
+    expect(workflow.permissions.contents).toBe("write");
   });
 
   it("has pull-requests: write permission", () => {
@@ -182,8 +182,8 @@ describe("call-reviewer job — request review", () => {
     expect(checkStep.run).toContain("gh pr list");
     expect(checkStep.run).toContain("--head");
     expect(checkStep.run).toContain("is_sub_pr");
-    // Must be the first step (before any review-requesting actions)
-    expect(steps[0].name).toContain("Check if this PR is a sub-PR");
+    // Must be the second step (after COPILOT_PAT validation)
+    expect(steps[1].name).toContain("Check if this PR is a sub-PR");
   });
 
   it("gates all review steps on is_sub_pr == false", () => {
@@ -406,6 +406,41 @@ describe("call-reviewer job — auto-resolve stale review threads", () => {
     );
     expect(step.with.script).toContain("linesChanged");
     expect(step.with.script).toContain("suggestionApplied");
+  });
+
+  it("auto-resolve step has full-file suggestion fallback for outdated threads", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const step = getJob().steps.find((s: any) =>
+      String(s.name).includes("Auto-resolve stale review threads"),
+    );
+    expect(step.with.script).toContain("suggestionAppliedFullFile");
+    // Full-file fallback only activates for outdated threads
+    expect(step.with.script).toContain("thread.isOutdated && suggestions");
+  });
+
+  it("auto-resolve step tracks changed files for outdated free-text resolution", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const step = getJob().steps.find((s: any) =>
+      String(s.name).includes("Auto-resolve stale review threads"),
+    );
+    expect(step.with.script).toContain("changedFiles");
+    expect(step.with.script).toContain("fileChanged");
+  });
+
+  it("auto-resolve step has four resolution paths", () => {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const step = getJob().steps.find((s: any) =>
+      String(s.name).includes("Auto-resolve stale review threads"),
+    );
+    const script = step.with.script;
+    // Path 1: windowed suggestion match
+    expect(script).toContain("suggestionApplied");
+    // Path 2: outdated + lines changed
+    expect(script).toContain("thread.isOutdated && linesChanged");
+    // Path 3: outdated + full-file suggestion match
+    expect(script).toContain("suggestionAppliedFullFile");
+    // Path 4: outdated + free-text + file changed
+    expect(script).toContain("!suggestions && fileChanged");
   });
 });
 
@@ -868,10 +903,11 @@ describe("dedup guard and @copilot invocation control", () => {
     expect(step.run).toContain("contains");
   });
 
-  it("sub-PR check is the first step, dedup guard is the second step in evaluate-and-fix", () => {
+  it("COPILOT_PAT validation is the first step, sub-PR check is the second, dedup guard is the third step in evaluate-and-fix", () => {
     const steps = getEvalAndFix().steps;
-    expect(steps[0].id).toBe("check-is-sub-pr");
-    expect(steps[1].id).toBe("dedup");
+    expect(steps[0].name).toContain("Validate COPILOT_PAT");
+    expect(steps[1].id).toBe("check-is-sub-pr");
+    expect(steps[2].id).toBe("dedup");
   });
 
   it("circuit breaker in evaluate-and-fix is gated on dedup guard", () => {
@@ -933,6 +969,140 @@ describe("dedup guard and @copilot invocation control", () => {
     expect(step.run).toContain("--add-reviewer @copilot");
     // No for-loop over variants — single reviewer name
     expect(step.run).not.toContain("for REVIEWER in");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Group 11b: Auto-approve steps — verify, wait for CI, approve
+// ---------------------------------------------------------------------------
+describe("evaluate-and-fix job — auto-approve on clean review", () => {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const getJob = () => workflow.jobs["evaluate-and-fix"] as Record<string, any>;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const getSteps = () => getJob().steps as any[];
+
+  it("has a 'Verify zero unresolved review threads' step", () => {
+    const step = getSteps().find((s: any) =>
+      String(s.name).includes("Verify zero unresolved review threads"),
+    );
+    expect(step).toBeDefined();
+    expect(step.id).toBe("verify-clean");
+  });
+
+  it("verify-clean step uses GraphQL to query review threads", () => {
+    const step = getSteps().find((s: any) => s.id === "verify-clean");
+    expect(step.with.script).toContain("reviewThreads");
+    expect(step.with.script).toContain("isResolved");
+    expect(step.with.script).toContain("all_resolved");
+  });
+
+  it("verify-clean step is gated on has_issues == false", () => {
+    const step = getSteps().find((s: any) => s.id === "verify-clean");
+    const cond = String(step.if);
+    expect(cond).toContain("analyze");
+    expect(cond).toContain("has_issues");
+    expect(cond).toContain("false");
+  });
+
+  it("has a 'Wait for CI checks to pass' step", () => {
+    const step = getSteps().find((s: any) =>
+      String(s.name).includes("Wait for CI checks to pass"),
+    );
+    expect(step).toBeDefined();
+    expect(step.id).toBe("ci-wait");
+  });
+
+  it("ci-wait step polls gh pr checks with a timeout", () => {
+    const step = getSteps().find((s: any) => s.id === "ci-wait");
+    expect(step.run).toContain("gh pr checks");
+    expect(step.run).toContain("MAX_WAIT");
+    expect(step.run).toContain("POLL_INTERVAL");
+    expect(step.run).toContain("ci_passed");
+  });
+
+  it("ci-wait step is gated on verify-clean.outputs.all_resolved", () => {
+    const step = getSteps().find((s: any) => s.id === "ci-wait");
+    const cond = String(step.if);
+    expect(cond).toContain("verify-clean");
+    expect(cond).toContain("all_resolved");
+  });
+
+  it("has an 'Auto-approve PR' step", () => {
+    const step = getSteps().find((s: any) =>
+      String(s.name).includes("Auto-approve PR"),
+    );
+    expect(step).toBeDefined();
+  });
+
+  it("auto-approve step uses APPROVER_PAT (not COPILOT_PAT)", () => {
+    const step = getSteps().find((s: any) =>
+      String(s.name).includes("Auto-approve PR"),
+    );
+    expect(String(step.env.GH_TOKEN)).toContain("APPROVER_PAT");
+    expect(String(step.env.GH_TOKEN)).not.toContain("COPILOT_PAT");
+  });
+
+  it("auto-approve step uses gh pr review --approve", () => {
+    const step = getSteps().find((s: any) =>
+      String(s.name).includes("Auto-approve PR"),
+    );
+    expect(step.run).toContain("gh pr review");
+    expect(step.run).toContain("--approve");
+  });
+
+  it("auto-approve step checks for skip-auto-approve label", () => {
+    const step = getSteps().find((s: any) =>
+      String(s.name).includes("Auto-approve PR"),
+    );
+    expect(step.run).toContain("skip-auto-approve");
+  });
+
+  it("auto-approve step checks if PR is already approved", () => {
+    const step = getSteps().find((s: any) =>
+      String(s.name).includes("Auto-approve PR"),
+    );
+    expect(step.run).toContain("APPROVED");
+    expect(step.run).toContain("already");
+  });
+
+  it("auto-approve step is gated on all prior conditions", () => {
+    const step = getSteps().find((s: any) =>
+      String(s.name).includes("Auto-approve PR"),
+    );
+    const cond = String(step.if);
+    expect(cond).toContain("dedup");
+    expect(cond).toContain("loop-limit");
+    expect(cond).toContain("analyze");
+    expect(cond).toContain("verify-clean");
+    expect(cond).toContain("ci-wait");
+    expect(cond).toContain("ci_passed");
+  });
+
+  it("auto-approve steps come after analyze and before auto-resolve", () => {
+    const steps = getSteps();
+    const analyzeIdx = steps.findIndex((s: any) =>
+      String(s.name).includes("Analyze Review"),
+    );
+    const verifyIdx = steps.findIndex((s: any) => s.id === "verify-clean");
+    const ciWaitIdx = steps.findIndex((s: any) => s.id === "ci-wait");
+    const approveIdx = steps.findIndex((s: any) =>
+      String(s.name).includes("Auto-approve PR"),
+    );
+    const resolveIdx = steps.findIndex((s: any) =>
+      String(s.name).includes("Auto-resolve threads"),
+    );
+    expect(verifyIdx).toBeGreaterThan(analyzeIdx);
+    expect(ciWaitIdx).toBeGreaterThan(verifyIdx);
+    expect(approveIdx).toBeGreaterThan(ciWaitIdx);
+    expect(resolveIdx).toBeGreaterThan(approveIdx);
+  });
+
+  it("auto-approve step handles self-approval failure gracefully", () => {
+    const step = getSteps().find((s: any) =>
+      String(s.name).includes("Auto-approve PR"),
+    );
+    expect(step.run).toContain("::warning::");
+    expect(step.run).toContain("self-approval");
   });
 });
 

@@ -21,12 +21,23 @@ jobs:
       github.event_name == 'schedule' ||
       (github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.name == 'CI')
     steps:
+      - name: Validate COPILOT_PAT
+        env:
+          TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::COPILOT_PAT is not set or empty. This workflow requires a valid PAT."
+            echo "Go to Settings > Secrets and variables > Actions > Repository secrets to configure it."
+            exit 1
+          fi
+          echo "COPILOT_PAT is available (${#TOKEN} chars)"
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.ref }}
           token: ${{ secrets.COPILOT_PAT }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
           cache: npm
@@ -59,8 +70,7 @@ jobs:
 
             echo ""
             echo "=== Validating dependency compatibility ==="
-            NPM_LS_OUTPUT="$(npm ls --depth=0 2>&1 || true)"
-            if echo "$NPM_LS_OUTPUT" | grep -qiE "ERESOLVE|peer dep|invalid"; then
+            if npm ls --depth=0 2>&1 | grep -qiE "ERESOLVE|peer dep|invalid"; then
               echo "npm audit fix broke dependencies — rolling back."
               git checkout -- package.json package-lock.json
             fi
@@ -101,12 +111,23 @@ jobs:
       github.event_name == 'schedule' ||
       (github.event.workflow_run.conclusion == 'failure' && github.event.workflow_run.name == 'CodeQL')
     steps:
+      - name: Validate COPILOT_PAT
+        env:
+          TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::COPILOT_PAT is not set or empty. This workflow requires a valid PAT."
+            echo "Go to Settings > Secrets and variables > Actions > Repository secrets to configure it."
+            exit 1
+          fi
+          echo "COPILOT_PAT is available (${#TOKEN} chars)"
+
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.event.workflow_run.head_sha || github.ref }}
           token: ${{ secrets.COPILOT_PAT }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
           cache: npm

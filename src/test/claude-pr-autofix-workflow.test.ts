@@ -13,28 +13,9 @@ const WORKFLOW_PATH = path.join(ROOT, ".github/workflows/claude-pr-autofix.yml")
 const readText = (p: string) => fs.readFileSync(p, "utf-8");
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-let workflow: Record<string, any>;
+const workflow = parse(readText(WORKFLOW_PATH)) as Record<string, any>;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-let autoFixJob: Record<string, any>;
-
-beforeAll(() => {
-  if (!fs.existsSync(WORKFLOW_PATH)) {
-    throw new Error(
-      `Expected workflow file to exist at ${WORKFLOW_PATH}, but it was not found.`
-    );
-  }
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  workflow = parse(readText(WORKFLOW_PATH)) as Record<string, any>;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  autoFixJob = workflow.jobs?.["auto-fix"] as Record<string, any>;
-
-  if (!autoFixJob) {
-    throw new Error(
-      'Expected workflow to define an "auto-fix" job under jobs["auto-fix"], but it was not found.'
-    );
-  }
-});
+const autoFixJob = workflow.jobs?.["auto-fix"] as Record<string, any>;
 
 describe("Claude PR Auto-Fix workflow file structure", () => {
   it("workflow file exists", () => {
@@ -159,10 +140,10 @@ describe("Claude PR Auto-Fix job configuration", () => {
     expect(checkoutStep).toBeDefined();
   });
 
-  it("includes actions/setup-node@v4 with npm cache", () => {
+  it("includes actions/setup-node with npm cache", () => {
     const setupNode = autoFixJob.steps.find(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (s: any) => typeof s.uses === "string" && s.uses.startsWith("actions/setup-node@v4")
+      (s: any) => typeof s.uses === "string" && s.uses.startsWith("actions/setup-node@")
     );
     expect(setupNode).toBeDefined();
     expect(setupNode.with?.cache).toBe("npm");

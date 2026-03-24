@@ -5,7 +5,7 @@
  * configured with proper job definitions, dependency graph, script
  * references, environment settings, and artifact configuration.
  */
-import { describe, it, expect, beforeAll } from "vitest";
+import { describe, it, expect } from "vitest";
 import fs from "fs";
 import path from "path";
 import { parse } from "yaml";
@@ -45,14 +45,36 @@ describe("Workflow file structure", () => {
     expect(ci.on.pull_request.types).toContain("labeled");
   });
 
-  it("defines exactly six jobs", () => {
-    expect(Object.keys(ci.jobs).length).toBe(6);
+  it("defines exactly seven jobs", () => {
+    expect(Object.keys(ci.jobs).length).toBe(7);
   });
 
-  it("defines the expected job IDs: lint-and-typecheck, test, security, test-coverage-check, build, copilot-deployment", () => {
+  it("defines the expected job IDs: diagnose, lint-and-typecheck, test, security, test-coverage-check, build, copilot-deployment", () => {
     const jobIds = new Set(Object.keys(ci.jobs));
-    const expected = new Set(["lint-and-typecheck", "test", "security", "test-coverage-check", "build", "copilot-deployment"]);
+    const expected = new Set(["diagnose", "lint-and-typecheck", "test", "security", "test-coverage-check", "build", "copilot-deployment"]);
     expect(jobIds).toEqual(expected);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Group 1b: Dependabot Skip Conditions
+// ---------------------------------------------------------------------------
+describe("Dependabot skip conditions", () => {
+  const DEPENDABOT_CONDITION = "github.actor != 'dependabot[bot]'";
+
+  it("every job in CI skips when actor is dependabot[bot]", () => {
+    for (const [jobName, job] of Object.entries(ci.jobs)) {
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const jobIf = (job as any).if as string | undefined;
+      expect(
+        jobIf,
+        `job "${jobName}" is missing an if condition`,
+      ).toBeDefined();
+      expect(
+        jobIf,
+        `job "${jobName}" should skip dependabot`,
+      ).toContain(DEPENDABOT_CONDITION);
+    }
   });
 });
 
@@ -76,10 +98,16 @@ describe("Job dependency graph and execution order", () => {
     expect(ci.jobs["test-coverage-check"].needs).toBeUndefined();
   });
 
-  it("test-coverage-check runs only on PRs with ready-to-merge label", () => {
-    const condition = ci.jobs["test-coverage-check"].if as string;
-    expect(condition).toContain("pull_request");
-    expect(condition).toContain("ready-to-merge");
+  it("test-coverage-check uses step-level conditions for ready-to-merge label", () => {
+    const job = ci.jobs["test-coverage-check"];
+    // Job-level if only contains the dependabot skip; ready-to-merge guard is at step level
+    expect(job.if).toContain("dependabot[bot]");
+    const steps = job.steps;
+    const hasReadyToMergeCondition = steps.some(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (step: any) => typeof step.if === "string" && step.if.includes("ready-to-merge"),
+    );
+    expect(hasReadyToMergeCondition).toBe(true);
   });
 
   it("build job depends on lint-and-typecheck, test, and security", () => {
@@ -213,9 +241,11 @@ describe("Script references and environment consistency", () => {
     }
   });
 
-  it("CI uses actions/checkout@v4 in all jobs", () => {
+  it("CI uses actions/checkout@v4 in all jobs that need source code", () => {
+    const JOBS_WITHOUT_CHECKOUT = ["diagnose"];
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     for (const [jobName, job] of Object.entries(ci.jobs) as [string, any][]) {
+      if (JOBS_WITHOUT_CHECKOUT.includes(jobName)) continue;
       const checkoutStep = job.steps.find(
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         (step: any) =>
@@ -295,12 +325,15 @@ describe("Artifact configuration and CI stage coverage", () => {
     expect(combined).toContain("npm audit");
   });
 
-  it("CI pipeline runs test coverage check only when ready-to-merge label is present", () => {
+  it("CI pipeline runs test coverage check with step-level ready-to-merge guard", () => {
     const coverageJob = ci.jobs["test-coverage-check"];
     expect(coverageJob).toBeDefined();
-    const condition = coverageJob.if as string;
-    expect(condition).toContain("pull_request");
-    expect(condition).toContain("ready-to-merge");
+    // Condition moved from job-level to step-level so the job always reports a status check
+    const hasReadyToMergeStep = coverageJob.steps.some(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (step: any) => typeof step.if === "string" && step.if.includes("ready-to-merge"),
+    );
+    expect(hasReadyToMergeStep).toBe(true);
   });
 });
 
@@ -372,27 +405,16 @@ describe("Security auto-fix configuration", () => {
 // Amplify Build Spec Tests (Groups 6–7)
 // ---------------------------------------------------------------------------
 
-const AMPLIFY_YML_PATH = path.join(ROOT, "amplify.yml");
-const hasAmplifyYml = fs.existsSync(AMPLIFY_YML_PATH);
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let amplifyConfig: any;
-let preBuildCommands: string[] = [];
-let buildCommands: string[] = [];
+const amplifyConfig = parse(readText("amplify.yml"));
+const preBuildCommands: string[] = amplifyConfig.frontend?.phases?.preBuild?.commands ?? [];
+const buildCommands: string[] = amplifyConfig.frontend?.phases?.build?.commands ?? [];
 
 // ---------------------------------------------------------------------------
 // Group 6: Amplify Build Spec File Structure
 // ---------------------------------------------------------------------------
-const createAmplifyTests = hasAmplifyYml ? describe : describe.skip;
-
-createAmplifyTests("amplify.yml build spec", () => {
-  beforeAll(() => {
-    amplifyConfig = parse(readText("amplify.yml"));
-    preBuildCommands = amplifyConfig.frontend?.phases?.preBuild?.commands ?? [];
-    buildCommands = amplifyConfig.frontend?.phases?.build?.commands ?? [];
-  });
-
+describe("amplify.yml build spec", () => {
   it("amplify.yml file exists at the repository root", () => {
-    expect(fs.existsSync(AMPLIFY_YML_PATH)).toBe(true);
+    expect(fs.existsSync(path.join(ROOT, "amplify.yml"))).toBe(true);
   });
 
   it("amplify.yml is valid YAML", () => {
@@ -421,7 +443,7 @@ createAmplifyTests("amplify.yml build spec", () => {
 // ---------------------------------------------------------------------------
 // Group 7: Amplify preBuild CI Gate
 // ---------------------------------------------------------------------------
-createAmplifyTests("amplify.yml preBuild CI gate", () => {
+describe("amplify.yml preBuild CI gate", () => {
   it("preBuild installs dependencies with npm ci", () => {
     expect(preBuildCommands).toContain("npm ci");
   });

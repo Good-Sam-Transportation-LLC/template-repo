@@ -170,10 +170,10 @@ describe("Copilot recursive loop workflow", () => {
     expect(parsed.permissions["pull-requests"]).toBe("write");
   });
 
-  it("recursive loop workflow has contents read permission", () => {
+  it("recursive loop workflow has contents write permission", () => {
     const content = readText(".github/workflows/copilot-recursive-loop.yml");
     const parsed = parse(content);
-    expect(parsed.permissions.contents).toBe("read");
+    expect(parsed.permissions.contents).toBe("write");
   });
 
   it("recursive loop workflow uses COPILOT_PAT for SWE agent trigger", () => {

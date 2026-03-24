@@ -15,6 +15,28 @@ const readText = (rel: string) => fs.readFileSync(path.join(ROOT, rel), "utf-8")
 const ciYaml = readText(".github/workflows/ci.yml");
 const ci = parse(ciYaml);
 
+type CiJobStep = {
+  if?: string;
+  run?: string;
+};
+
+type CiJob = {
+  if?: string;
+  steps: CiJobStep[];
+};
+
+/**
+ * Helper to check whether a job has any step with an `if` condition
+ * that references the "ready-to-merge" label.
+ */
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+const hasReadyToMergeStepCondition = (job: any): boolean =>
+  Array.isArray(job.steps) &&
+  job.steps.some(
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (step: any) => typeof step.if === "string" && step.if.includes("ready-to-merge"),
+  );
+
 // ---------------------------------------------------------------------------
 // Group 1: Shell Script Validation
 // ---------------------------------------------------------------------------
@@ -54,18 +76,17 @@ describe("CI workflow integration", () => {
     expect(ci.jobs["test-coverage-check"]).toBeDefined();
   });
 
-  it("test-coverage-check runs only on PRs with ready-to-merge label", () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const job = ci.jobs["test-coverage-check"] as any;
-    expect(job.if).toContain("pull_request");
-    expect(job.if).toContain("ready-to-merge");
+  it("test-coverage-check uses step-level conditions for ready-to-merge label", () => {
+    const job = ci.jobs["test-coverage-check"] as CiJob;
+    // Job-level if only contains the dependabot skip; ready-to-merge guard is at step level
+    expect(job.if).toContain("dependabot[bot]");
+    const hasReadyToMergeCondition = hasReadyToMergeStepCondition(job);
+    expect(hasReadyToMergeCondition).toBe(true);
   });
 
   it("test-coverage-check job runs the coverage script", () => {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const job = ci.jobs["test-coverage-check"] as any;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const hasScript = job.steps.some((step: any) =>
+    const job = ci.jobs["test-coverage-check"] as CiJob;
+    const hasScript = job.steps.some((step: CiJobStep) =>
       typeof step.run === "string" && step.run.includes("check-test-coverage.sh"),
     );
     expect(hasScript).toBe(true);

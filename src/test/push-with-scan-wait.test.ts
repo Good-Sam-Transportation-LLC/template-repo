@@ -77,16 +77,25 @@ describe("push-with-scan-wait.sh script", () => {
   });
 
   it("script has valid bash syntax", () => {
-    if (process.platform === "win32") return;
-    try {
-      execSync("bash --version", { stdio: "ignore" });
-    } catch {
-      return; // bash not available, skip
+    // On Windows or environments without bash, this check should not hard-fail.
+    if (process.platform === "win32") {
+      expect(true).toBe(true); // Skip: bash syntax check not applicable on Windows.
+      return;
     }
-    const result = execSync(`bash -n "${SCRIPT_PATH}" 2>&1`, {
-      encoding: "utf-8",
-    });
-    expect(result).toBe("");
+
+    try {
+      const result = execSync(`bash -n "${SCRIPT_PATH}" 2>&1`, {
+        encoding: "utf-8",
+      });
+      expect(result).toBe("");
+    } catch (err: any) {
+      // If bash is not available, avoid crashing the test with an unclear error.
+      if (err && (err.code === "ENOENT" || err.message?.includes("ENOENT"))) {
+        expect(true).toBe(true); // Skip: bash not available in this environment.
+        return;
+      }
+      throw err;
+    }
   });
 });
 

@@ -13,9 +13,9 @@ const WORKFLOW_PATH = path.join(ROOT, ".github/workflows/sub-pr-auto-merge.yml")
 const readText = (p: string) => fs.readFileSync(p, "utf-8");
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-let workflow: Record<string, any> = {};
+let workflow!: Record<string, any>;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-let job: Record<string, any> = {};
+let job!: Record<string, any>;
 
 beforeAll(() => {
   if (!fs.existsSync(WORKFLOW_PATH)) {
@@ -52,14 +52,6 @@ beforeAll(() => {
 });
 
 describe("Sub-PR Auto-Merge workflow file structure", () => {
-  it("workflow file exists", () => {
-    const exists = fs.existsSync(WORKFLOW_PATH);
-    if (!exists) {
-      throw new Error(`Expected workflow file at ${WORKFLOW_PATH}, but none was found.`);
-    }
-    expect(exists).toBe(true);
-  });
-
   it('is named "Sub-PR Auto-Merge"', () => {
     expect(workflow.name).toBe("Sub-PR Auto-Merge");
   });
@@ -75,8 +67,8 @@ describe("Sub-PR Auto-Merge workflow file structure", () => {
     expect(workflow.on).not.toHaveProperty("push");
   });
 
-  it("has contents:read permission", () => {
-    expect(workflow.permissions?.contents).toBe("read");
+  it("has contents:write permission", () => {
+    expect(workflow.permissions?.contents).toBe("write");
   });
 
   it("has pull-requests:write permission", () => {
