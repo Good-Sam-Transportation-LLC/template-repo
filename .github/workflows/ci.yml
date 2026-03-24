@@ -263,7 +263,7 @@ jobs:
         if: >-
           github.event_name == 'pull_request' &&
           contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
