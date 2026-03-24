@@ -8,17 +8,17 @@ This file is read automatically by the OpenAI Codex CLI when running in this rep
 
 Configure how much Codex can do without stopping for confirmation:
 
-- **Never-ask / `-a never`** (recommended for sandboxed CI): Auto-executes all commands, never prompts for approval. Always combine with `--sandbox workspace-write` so execution is scoped to the workspace. This is what you typically want for non-interactive CI — "approval: never" in the startup banner confirms this mode.
+- **Never-ask / `-a never`** (used in `workflow-autofix.yml` and `security-autofix.yml`): Auto-executes all commands, never prompts for approval. Combined with `--sandbox workspace-write` so execution is scoped to the workspace. "approval: never" in the startup banner confirms this mode.
   ```bash
   codex exec -a never --sandbox workspace-write "your prompt"
   ```
 - **On-request / `-a on-request`**: The model decides when to ask for approval. Suitable for interactive local sessions where a human is present.
 - **Untrusted / `-a untrusted`**: Asks before running non-trusted commands (anything beyond ls, cat, sed, etc.). Conservative mode for auditing.
-- **Full bypass** (`--dangerously-bypass-approvals-and-sandbox`): Skips both approval and sandbox. Only use in tightly controlled, non-interactive workflows where full repository access is explicitly intended (for example, `.github/workflows/codex-review.yml` and `.github/workflows/auto-test-generation.yml` currently invoke Codex with this flag). For most CI and local usage, prefer `-a never --sandbox workspace-write` instead.
+- **Full bypass** (`--dangerously-bypass-approvals-and-sandbox`): Skips both approval and sandbox. Used in `codex-review.yml` and `auto-test-generation.yml` where Codex needs unrestricted file access to apply multi-file fixes and generate tests.
 
 Switch modes interactively with `/permissions` inside an interactive Codex session.
 
-> **Note:** `--full-auto` is a convenience alias that maps to `-a on-request --sandbox workspace-write`. It is not used in the current CI workflows; instead, some workflows use `--dangerously-bypass-approvals-and-sandbox` for full, unsandboxed automation. When reproducing CI failures locally, default to `-a never --sandbox workspace-write`.
+> **Note:** `--full-auto` is a convenience alias that maps to `-a on-request --sandbox workspace-write`. It was replaced with the explicit `-a never --sandbox workspace-write` in CI workflows to avoid ambiguity and ensure truly non-interactive execution.
 
 ---
 
@@ -33,7 +33,7 @@ When a CI workflow fails, follow this checklist to diagnose and fix:
 5. **Build failures** (`npm run build`): Fix missing imports, resolve circular dependencies, correct asset paths, fix Vite/Rollup config issues.
 6. **Workflow YAML errors**: Fix indentation (YAML is indentation-sensitive), quote strings containing special characters, correct `uses:` action version pins.
 7. **Security audit** (`npm audit`): Run `npm audit fix` first; if that's insufficient, `npm audit fix --force` — but then run `npm ls --depth=0` to verify no peer dependency breakage. If force-fix broke deps, roll back with `git checkout -- package.json package-lock.json && npm ci`.
-8. **Dependency conflicts**: Check `npm ls` for peer dep errors. When necessary, pin exact versions in `package.json` (no `^` prefix) to resolve conflicts.
+8. **Dependency conflicts**: Check `npm ls` for peer dep errors. Pin exact versions in `package.json` (no `^` prefix). The `.npmrc` has `save-exact=true` to prevent caret ranges.
 
 After fixing any issue, always verify the full suite before committing:
 

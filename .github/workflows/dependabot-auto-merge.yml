@@ -1,0 +1,42 @@
+name: Dependabot Auto-Merge
+
+on: pull_request_target
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  auto-merge:
+    name: Auto-Merge Dependabot
+    if: github.actor == 'dependabot[bot]'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Fetch Dependabot metadata
+        id: metadata
+        uses: dependabot/fetch-metadata@v2
+        with:
+          github-token: ${{ github.token }}
+
+      - name: Auto-approve minor and patch updates
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_PAT }}
+        run: gh pr review "${{ github.event.pull_request.html_url }}" --approve --body "Auto-approved (dependabot ${{ steps.metadata.outputs.update-type }})"
+
+      - name: Enable auto-merge for minor and patch updates
+        if: steps.metadata.outputs.update-type != 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh pr merge "${{ github.event.pull_request.html_url }}" --auto --merge
+
+      - name: Comment on major updates
+        if: steps.metadata.outputs.update-type == 'version-update:semver-major'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh pr comment "${{ github.event.pull_request.html_url }}" --body \
+            "⚠️ **Major version update** — requires manual review before merging.
+
+          **Package:** ${{ steps.metadata.outputs.dependency-names }}
+          **Update type:** ${{ steps.metadata.outputs.update-type }}"

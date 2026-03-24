@@ -13,12 +13,19 @@ jobs:
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.COPILOT_PAT || github.token }}
 
       - name: Delete all non-essential remote branches
-        env:
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
-          KEEP_BRANCHES="${DEFAULT_BRANCH:-main} feature/tests develop release"
+          KEEP_BRANCHES="main master feature/tests develop release"
+
+          # Safety: abort if critical branches are missing from keep list
+          for critical in main master; do
+            if ! echo "$KEEP_BRANCHES" | grep -qw "$critical"; then
+              echo "::error::Critical branch '$critical' missing from KEEP_BRANCHES. Aborting."
+              exit 1
+            fi
+          done
 
           echo "Fetching all remote branches..."
           git fetch --prune

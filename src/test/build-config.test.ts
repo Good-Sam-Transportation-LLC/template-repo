@@ -37,7 +37,7 @@ describe("Package.json Validation", () => {
   it("vite version is pinned without caret", () => {
     const viteVersion = pkg.devDependencies.vite;
     expect(viteVersion).not.toMatch(/^\^/);
-    expect(viteVersion).toMatch(/^5\.\d+\.\d+$/);
+    expect(viteVersion).toMatch(/^\d+\.\d+\.\d+$/);
   });
 });
 

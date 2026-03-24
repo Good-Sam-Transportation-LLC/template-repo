@@ -7,14 +7,74 @@ on:
     branches: ["**"]
     types: [opened, synchronize, reopened, labeled]
 
+permissions:
+  contents: read
+
 jobs:
+  diagnose:
+    name: Diagnose Secrets
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      !startsWith(github.head_ref, 'dependabot/') &&
+      !startsWith(github.ref_name, 'dependabot/')
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - name: Check COPILOT_PAT
+        env:
+          TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          echo "===== COPILOT_PAT ====="
+          if [ -z "$TOKEN" ]; then
+            echo "::error::COPILOT_PAT is EMPTY or NOT SET"
+          else
+            echo "COPILOT_PAT is set (length: ${#TOKEN} chars)"
+          fi
+
+      - name: Check APPROVER_PAT
+        env:
+          TOKEN: ${{ secrets.APPROVER_PAT }}
+        run: |
+          echo "===== APPROVER_PAT ====="
+          if [ -z "$TOKEN" ]; then
+            echo "::warning::APPROVER_PAT is EMPTY or NOT SET"
+          else
+            echo "APPROVER_PAT is set (length: ${#TOKEN} chars)"
+          fi
+
+      - name: Test default GITHUB_TOKEN
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "===== GITHUB_TOKEN ====="
+          gh auth status
+          gh api "repos/${{ github.repository }}" --jq '.full_name,.permissions' || true
+
+      - name: Test COPILOT_PAT access
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          if [ -z "$GH_TOKEN" ]; then
+            echo "Skipping — COPILOT_PAT not set"
+            exit 0
+          fi
+          echo "===== gh auth with COPILOT_PAT ====="
+          gh auth status || echo "::error::gh auth FAILED"
+          echo "===== Repo access ====="
+          gh api "repos/${{ github.repository }}" --jq '.full_name,.permissions' \
+            || echo "::error::Repo access FAILED"
+
   lint-and-typecheck:
     name: Lint & Type Check
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      !startsWith(github.head_ref, 'dependabot/') &&
+      !startsWith(github.ref_name, 'dependabot/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
           cache: npm
@@ -29,11 +89,15 @@ jobs:
 
   test:
     name: Unit Tests
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      !startsWith(github.head_ref, 'dependabot/') &&
+      !startsWith(github.ref_name, 'dependabot/')
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
           cache: npm
@@ -45,13 +109,19 @@ jobs:
 
   security:
     name: Security Audit & Auto-Fix
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      !startsWith(github.head_ref, 'dependabot/') &&
+      !startsWith(github.ref_name, 'dependabot/')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           token: ${{ secrets.COPILOT_PAT || github.token }}
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
           cache: npm
@@ -78,8 +148,7 @@ jobs:
             npm audit fix 2>&1 || true
 
             # Verify the fix didn't break peer dependencies
-            LS_OUTPUT="$(npm ls --depth=0 2>&1 || true)"
-            if echo "$LS_OUTPUT" | grep -qiE "ERESOLVE|peer dep|invalid"; then
+            if npm ls --depth=0 2>&1 | grep -qiE "ERESOLVE|peer dep|invalid"; then
               echo "npm audit fix broke dependencies — rolling back."
               git checkout -- package.json package-lock.json
               npm ci
@@ -111,25 +180,42 @@ jobs:
   test-coverage-check:
     name: PR Test Coverage
     if: >-
-      github.event_name == 'pull_request' &&
-      contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
+      github.actor != 'dependabot[bot]' &&
+      !startsWith(github.head_ref, 'dependabot/') &&
+      !startsWith(github.ref_name, 'dependabot/')
     runs-on: ubuntu-latest
     steps:
+      - name: Skip if not ready to merge
+        if: >-
+          github.event_name != 'pull_request' ||
+          !contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
+        run: echo "Skipping — 'ready-to-merge' label not present"
+
       - uses: actions/checkout@v4
+        if: >-
+          github.event_name == 'pull_request' &&
+          contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
         with:
           fetch-depth: 0
 
       - name: Check test coverage for changed files
+        if: >-
+          github.event_name == 'pull_request' &&
+          contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
         run: bash .github/scripts/check-test-coverage.sh
 
   build:
     name: Build & Verify
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      !startsWith(github.head_ref, 'dependabot/') &&
+      !startsWith(github.ref_name, 'dependabot/')
     runs-on: ubuntu-latest
     needs: [lint-and-typecheck, test, security]
     steps:
       - uses: actions/checkout@v4
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v6
         with:
           node-version: 20
           cache: npm
@@ -151,25 +237,41 @@ jobs:
 
   copilot-deployment:
     name: Copilot Deployment
+    if: >-
+      github.actor != 'dependabot[bot]' &&
+      !startsWith(github.head_ref, 'dependabot/') &&
+      !startsWith(github.ref_name, 'dependabot/')
     runs-on: ubuntu-latest
     needs: [build]
-    if: >-
-      github.event_name == 'pull_request' &&
-      contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
     permissions:
       deployments: write
-    environment:
-      name: copilot
     steps:
+      - name: Skip if not ready to merge
+        if: >-
+          github.event_name != 'pull_request' ||
+          !contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
+        run: echo "Skipping — 'ready-to-merge' label not present"
+
       - uses: actions/checkout@v4
+        if: >-
+          github.event_name == 'pull_request' &&
+          contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
+        with:
+          token: ${{ secrets.COPILOT_PAT || github.token }}
 
       - name: Download build artifact
+        if: >-
+          github.event_name == 'pull_request' &&
+          contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
         uses: actions/download-artifact@v4
         with:
           name: dist
           path: dist/
 
       - name: Verify build artifact
+        if: >-
+          github.event_name == 'pull_request' &&
+          contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
         run: |
           echo "Verifying build artifact..."
           test -f dist/index.html || { echo "ERROR: dist/index.html not found"; exit 1; }

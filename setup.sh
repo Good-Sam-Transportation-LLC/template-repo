@@ -27,13 +27,26 @@ cp "$SCRIPT_DIR/tsconfig.json" "$TARGET_DIR/"
 cp "$SCRIPT_DIR/tsconfig.app.json" "$TARGET_DIR/"
 cp "$SCRIPT_DIR/postcss.config.js" "$TARGET_DIR/"
 cp "$SCRIPT_DIR/package.json" "$TARGET_DIR/"
+cp "$SCRIPT_DIR/tailwind.config.ts" "$TARGET_DIR/"
+cp "$SCRIPT_DIR/tsconfig.node.json" "$TARGET_DIR/"
+cp "$SCRIPT_DIR/playwright.config.ts" "$TARGET_DIR/"
+cp "$SCRIPT_DIR/playwright-fixture.ts" "$TARGET_DIR/"
+cp "$SCRIPT_DIR/components.json" "$TARGET_DIR/"
+cp "$SCRIPT_DIR/.npmrc" "$TARGET_DIR/"
+cp "$SCRIPT_DIR/.gitignore" "$TARGET_DIR/"
+cp "$SCRIPT_DIR/amplify.yml" "$TARGET_DIR/"
+cp "$SCRIPT_DIR/CLAUDE.md" "$TARGET_DIR/"
+cp "$SCRIPT_DIR/AGENTS.md" "$TARGET_DIR/"
+cp "$SCRIPT_DIR/SECURITY.md" "$TARGET_DIR/"
+cp "$SCRIPT_DIR/SECRETS_AND_VARIABLES.md" "$TARGET_DIR/"
+cp "$SCRIPT_DIR/README.md" "$TARGET_DIR/"
 
 # Make scripts executable
-chmod +x "$TARGET_DIR/.github/scripts/check-test-coverage.sh"
+chmod +x "$TARGET_DIR/.github/scripts/"*.sh
 
 # Update package.json with project name
 if command -v sed &>/dev/null; then
-  sed -i "s/\"name\": \"vite-react-template\"/\"name\": \"$PROJECT_NAME\"/" "$TARGET_DIR/package.json"
+  sed -i "s/\"name\": \"vite_react_shadcn_ts\"/\"name\": \"$PROJECT_NAME\"/" "$TARGET_DIR/package.json"
 fi
 
 # Create minimal source structure
@@ -118,26 +131,6 @@ if [ ! -f "$TARGET_DIR/index.html" ]; then
   </body>
 </html>
 HTML
-fi
-
-# Create .gitignore
-if [ ! -f "$TARGET_DIR/.gitignore" ]; then
-  cat > "$TARGET_DIR/.gitignore" << 'GITIGNORE'
-node_modules
-dist
-dist-ssr
-*.local
-.vscode/*
-!.vscode/extensions.json
-.idea
-.DS_Store
-*.suo
-*.ntvs*
-*.njsproj
-*.sln
-*.sw?
-.claude/
-GITIGNORE
 fi
 
 # Initialize git repo

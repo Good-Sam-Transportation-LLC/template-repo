@@ -72,11 +72,13 @@ This repository is configured so Copilot operates **fully autonomously** — no 
 
 ### Required Secrets:
 - **`COPILOT_PAT`** — A fine-grained Personal Access Token (PAT) with Read & Write access to Pull Requests, Issues, and Contents. Required because `GITHUB_TOKEN` cannot wake native bots like `@copilot`. Create from a user account with write access to the repository.
+- **`APPROVER_PAT`** — A fine-grained PAT from a **different** GitHub account than the PR author, with Read & Write access to Pull Requests. Used by the auto-approve step to approve PRs when the Copilot review loop completes cleanly. GitHub blocks self-approval, so this must be from a separate bot/service account.
 
 ### Repository Settings Required:
 1. Go to **Repository Settings** > **Rules** > **Rulesets** and ensure branch protection is configured (see Section 1)
 2. Do NOT enable "Automatically request Copilot code review" — the workflow handles review requests explicitly
 3. Add `COPILOT_PAT` to repository secrets (Settings > Secrets and variables > Actions)
+4. Add `APPROVER_PAT` to repository secrets — from a **different** account than the PR author (required for auto-approval)
 4. The recursive loop workflow runs automatically — no additional settings needed
 
 ## 5. How It Works in CI

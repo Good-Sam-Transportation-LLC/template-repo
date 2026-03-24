@@ -54,8 +54,7 @@ for file in $FILES; do
   if [ "$ext" = "tsx" ]; then
     # Convert kebab-case name to PascalCase for use as a JS identifier
     # e.g. "use-mobile" -> "UseMobile", "my-component" -> "MyComponent"
-    # Use portable bash string manipulation (avoid GNU sed \U which fails on macOS/BSD)
-    component_name=$(echo "$name" | awk -F'-' '{out=""; for(i=1;i<=NF;i++) out=out toupper(substr($i,1,1)) substr($i,2); print out}')
+    component_name=$(echo "$name" | awk 'BEGIN{FS="-"; OFS=""} {for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) substr($i,2); print}')
     # Generate React component test stub
     cat > "$test_file" << TESTEOF
 import { describe, it, expect } from "vitest";
@@ -77,7 +76,7 @@ describe("${component_name}", () => {
 TESTEOF
   else
     # Generate utility/hook test stub
-    module_name=$(echo "$name" | awk -F'-' '{out=""; for(i=1;i<=NF;i++) out=out toupper(substr($i,1,1)) substr($i,2); print out}')
+    module_name=$(echo "$name" | awk 'BEGIN{FS="-"; OFS=""} {for(i=1;i<=NF;i++) $i=toupper(substr($i,1,1)) substr($i,2); print}')
     cat > "$test_file" << TESTEOF
 import { describe, it, expect } from "vitest";
 import * as module from "${import_path}";

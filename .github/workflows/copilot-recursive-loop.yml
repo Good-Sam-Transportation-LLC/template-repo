@@ -7,7 +7,7 @@ on:
     types: [submitted]
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
   issues: write
 
@@ -21,23 +21,34 @@ jobs:
     name: Request Copilot Review
     if: >
       github.event_name == 'pull_request' &&
-      github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     concurrency:
       group: copilot-review-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     steps:
+      - name: Validate COPILOT_PAT
+        env:
+          TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::COPILOT_PAT is not set or empty. This workflow requires a valid PAT."
+            echo "Go to Settings > Secrets and variables > Actions > Repository secrets to configure it."
+            exit 1
+          fi
+          echo "COPILOT_PAT is available (${#TOKEN} chars)"
+
       - name: Check if this PR is a sub-PR
         id: check-is-sub-pr
         env:
           GH_TOKEN: ${{ secrets.COPILOT_PAT }}
           REPO: ${{ github.repository }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           # A sub-PR's base branch is the head branch of another open PR (the parent)
           PARENT_PR=$(gh pr list -R "$REPO" --state open \
-            --head "$BASE_REF" --base "$DEFAULT_BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
+            --head "$BASE_REF" --json number --jq '.[0].number' 2>/dev/null || echo "")
           if [ -n "$PARENT_PR" ] && [ "$PARENT_PR" != "null" ]; then
             echo "This PR is a sub-PR — base branch '$BASE_REF' is the head of parent PR #$PARENT_PR."
             echo "is_sub_pr=true" >> $GITHUB_OUTPUT
@@ -110,11 +121,15 @@ jobs:
       # ──────────────────────────────────────────────────────────────────────────
       # NOTE: This step is intentionally part of the recursive-loop workflow (not
       # the standalone sub-pr-auto-merge workflow). After each push it resolves
-      # threads whose diff lines changed AND the thread is marked outdated by
-      # GitHub, or threads whose suggested code change has been applied verbatim.
+      # threads via four paths:
+      #   1. Suggestion applied (windowed ±10 lines) — works for any thread
+      #   2. Outdated + lines changed — thread.isOutdated AND diff overlaps comment lines
+      #   3. Outdated + suggestion applied (full-file) — outdated thread whose suggestion
+      #      text exists anywhere in the current file (catches shifted-line scenarios)
+      #   4. Outdated + free-text + file changed — outdated free-text comment on a file
+      #      that has any modifications in the diff (code the reviewer saw no longer exists)
       # Only threads already flagged by GitHub as `isOutdated` are eligible for
-      # line-overlap resolution, preventing active threads from being silently
-      # dismissed just because surrounding code changed.
+      # paths 2-4, preventing active threads from being silently dismissed.
       - name: Auto-resolve stale review threads after code changes
         if: steps.check-is-sub-pr.outputs.is_sub_pr == 'false'
         uses: actions/github-script@v7
@@ -200,6 +215,17 @@ jobs:
               }
               if (ranges.length > 0) {
                 changedRanges.set(file.filename, ranges);
+              }
+            }
+
+            // Build a set of all changed file paths (for path 4: outdated free-text + file changed)
+            const changedFiles = new Set();
+            for (const file of (compare.data.files || [])) {
+              if (file.filename) {
+                changedFiles.add(file.filename);
+              }
+              if (file.previous_filename) {
+                changedFiles.add(file.previous_filename);
               }
             }
 
@@ -291,10 +317,25 @@ jobs:
                 }
               }
 
-              // Resolve if suggestion was applied, or if the thread is outdated AND lines changed.
-              // Require isOutdated for line-overlap resolution to avoid incorrectly dismissing
-              // active review threads whose surrounding code happened to change.
-              if (suggestionApplied || (thread.isOutdated && linesChanged)) {
+              // Path 3: Full-file suggestion match for outdated threads (catches shifted lines)
+              let suggestionAppliedFullFile = false;
+              if (!suggestionApplied && thread.isOutdated && suggestions) {
+                const fileContent = await getFileContent(filePath);
+                if (fileContent) {
+                  const normalizedFile = normalize(fileContent);
+                  suggestionAppliedFullFile = suggestions.some(s => {
+                    const trimmed = s.trimEnd();
+                    return trimmed && normalizedFile.includes(normalize(trimmed));
+                  });
+                }
+              }
+
+              // Path 4: Outdated free-text comment on a file that has any modifications
+              const fileChanged = changedFiles.has(filePath);
+
+              // Resolve via any of the four paths. Paths 2-4 require isOutdated to avoid
+              // incorrectly dismissing active review threads.
+              if (suggestionApplied || suggestionAppliedFullFile || (thread.isOutdated && linesChanged) || (thread.isOutdated && !suggestions && fileChanged)) {
                 try {
                   await github.graphql(`
                     mutation($threadId: ID!) {
@@ -304,7 +345,20 @@ jobs:
                     }
                   `, { threadId: thread.id });
                   resolvedCount++;
-                  const reason = suggestionApplied ? 'suggestion applied' : 'outdated + lines changed in diff';
+                  const path2 = thread.isOutdated && linesChanged;
+                  const path4 = thread.isOutdated && !suggestions && fileChanged && !linesChanged;
+                  let reason;
+                  if (suggestionApplied) {
+                    reason = 'suggestion applied (windowed)';
+                  } else if (suggestionAppliedFullFile) {
+                    reason = 'suggestion applied (full-file, outdated thread)';
+                  } else if (path2) {
+                    reason = 'outdated + lines changed in diff';
+                  } else if (path4) {
+                    reason = 'outdated free-text + file changed';
+                  } else {
+                    reason = 'unknown resolution path';
+                  }
                   const loc = commentStartLine || commentLine || '?';
                   console.log(`Resolved thread ${thread.id} (${filePath}:${loc} — ${reason})`);
                 } catch (e) {
@@ -462,23 +516,34 @@ jobs:
       github.event.pull_request.head.repo.full_name == github.repository &&
       github.event.review.user.login == 'Copilot' &&
       github.event.review.state != 'approved' &&
-      github.event.review.commit_id == github.event.pull_request.head.sha
+      github.event.review.commit_id == github.event.pull_request.head.sha &&
+      github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     concurrency:
       group: copilot-fix-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     steps:
+      - name: Validate COPILOT_PAT
+        env:
+          TOKEN: ${{ secrets.COPILOT_PAT }}
+        run: |
+          if [ -z "$TOKEN" ]; then
+            echo "::error::COPILOT_PAT is not set or empty. This workflow requires a valid PAT."
+            echo "Go to Settings > Secrets and variables > Actions > Repository secrets to configure it."
+            exit 1
+          fi
+          echo "COPILOT_PAT is available (${#TOKEN} chars)"
+
       - name: Check if this PR is a sub-PR
         id: check-is-sub-pr
         env:
           GH_TOKEN: ${{ secrets.COPILOT_PAT }}
           REPO: ${{ github.repository }}
           BASE_REF: ${{ github.event.pull_request.base.ref }}
-          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           # A sub-PR's base branch is the head branch of another open PR (the parent)
           PARENT_PR=$(gh pr list -R "$REPO" --state open \
-            --head "$BASE_REF" --base "$DEFAULT_BRANCH" --json number --jq '.[0].number' 2>/dev/null || echo "")
+            --head "$BASE_REF" --json number --jq '.[0].number' 2>/dev/null || echo "")
           if [ -n "$PARENT_PR" ] && [ "$PARENT_PR" != "null" ]; then
             echo "This PR is a sub-PR — base branch '$BASE_REF' is the head of parent PR #$PARENT_PR. Skipping evaluate-and-fix."
             echo "is_sub_pr=true" >> $GITHUB_OUTPUT
@@ -607,6 +672,140 @@ jobs:
             gh pr comment "$PR_NUMBER" -R "$REPO" --body \
               "**Auto-fix loop complete!** The Copilot Code Reviewer found no further actionable issues."
           fi
+
+      # ────────────────────────────────────────────────────────
+      # AUTO-APPROVE: When the review loop completes cleanly,
+      # verify zero unresolved threads, wait for CI, and approve.
+      # Requires APPROVER_PAT from a different account than the
+      # PR author (GitHub blocks self-approval).
+      # ────────────────────────────────────────────────────────
+      - name: Verify zero unresolved review threads
+        if: steps.dedup.outputs.skip == 'false' && steps.loop-limit.outputs.stop == 'false' && steps.analyze.outputs.has_issues == 'false'
+        id: verify-clean
+        uses: actions/github-script@v7
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+        with:
+          github-token: ${{ secrets.COPILOT_PAT }}
+          script: |
+            const prNumber = parseInt('${{ github.event.pull_request.number }}', 10);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+
+            let allThreads = [];
+            let hasNextPage = true;
+            let cursor = null;
+
+            while (hasNextPage) {
+              const afterClause = cursor ? `, after: "${cursor}"` : '';
+              const query = `
+                query($owner: String!, $repo: String!, $prNumber: Int!) {
+                  repository(owner: $owner, name: $repo) {
+                    pullRequest(number: $prNumber) {
+                      reviewThreads(first: 100${afterClause}) {
+                        pageInfo { hasNextPage endCursor }
+                        nodes { id, isResolved, isOutdated }
+                      }
+                    }
+                  }
+                }
+              `;
+              const result = await github.graphql(query, { owner, repo, prNumber });
+              const threads = result.repository.pullRequest.reviewThreads;
+              allThreads.push(...threads.nodes);
+              hasNextPage = threads.pageInfo.hasNextPage;
+              cursor = threads.pageInfo.endCursor;
+            }
+
+            const unresolved = allThreads.filter(t => !t.isResolved);
+            console.log(`Total threads: ${allThreads.length}, unresolved: ${unresolved.length}`);
+
+            if (unresolved.length > 0) {
+              console.log('Unresolved threads remain — skipping auto-approve.');
+              core.setOutput('all_resolved', 'false');
+            } else {
+              console.log('All review threads resolved.');
+              core.setOutput('all_resolved', 'true');
+            }
+
+      - name: Wait for CI checks to pass
+        if: >
+          steps.dedup.outputs.skip == 'false' &&
+          steps.loop-limit.outputs.stop == 'false' &&
+          steps.analyze.outputs.has_issues == 'false' &&
+          steps.verify-clean.outputs.all_resolved == 'true'
+        id: ci-wait
+        env:
+          GH_TOKEN: ${{ secrets.COPILOT_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          MAX_WAIT=600
+          POLL_INTERVAL=30
+          ELAPSED=0
+
+          echo "Waiting for CI checks to pass on PR #$PR_NUMBER (up to ${MAX_WAIT}s)..."
+
+          while [ "$ELAPSED" -lt "$MAX_WAIT" ]; do
+            # Get check status summary
+            STATUS=$(gh pr checks "$PR_NUMBER" -R "$REPO" 2>&1 || true)
+
+            # Count pending/failing checks (exclude this workflow's own checks)
+            PENDING=$(echo "$STATUS" | grep -c "pending\|queued\|in_progress\|waiting" || true)
+            FAILING=$(echo "$STATUS" | grep -c "fail\|error\|cancelled\|timed_out\|action_required" || true)
+
+            echo "CI status at ${ELAPSED}s: pending=$PENDING, failing=$FAILING"
+
+            if [ "$FAILING" -gt 0 ]; then
+              echo "::warning::CI checks are failing — skipping auto-approve."
+              echo "ci_passed=false" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            if [ "$PENDING" -eq 0 ]; then
+              echo "All CI checks passed."
+              echo "ci_passed=true" >> $GITHUB_OUTPUT
+              exit 0
+            fi
+
+            sleep "$POLL_INTERVAL"
+            ELAPSED=$((ELAPSED + POLL_INTERVAL))
+          done
+
+          echo "::warning::CI checks still pending after ${MAX_WAIT}s — skipping auto-approve."
+          echo "ci_passed=false" >> $GITHUB_OUTPUT
+
+      - name: Auto-approve PR
+        if: >
+          steps.dedup.outputs.skip == 'false' &&
+          steps.loop-limit.outputs.stop == 'false' &&
+          steps.analyze.outputs.has_issues == 'false' &&
+          steps.verify-clean.outputs.all_resolved == 'true' &&
+          steps.ci-wait.outputs.ci_passed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.APPROVER_PAT }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Check for skip-auto-approve label
+          LABELS=$(gh pr view "$PR_NUMBER" -R "$REPO" --json labels --jq '.labels[].name' 2>/dev/null || true)
+          if echo "$LABELS" | grep -q "skip-auto-approve"; then
+            echo "PR has 'skip-auto-approve' label — skipping."
+            exit 0
+          fi
+
+          # Check if PR is already approved
+          LATEST_REVIEW=$(gh api "repos/$REPO/pulls/$PR_NUMBER/reviews" \
+            --jq '[.[] | select(.state == "APPROVED")] | length' 2>/dev/null || echo "0")
+          if [ "$LATEST_REVIEW" -gt 0 ]; then
+            echo "PR already has an approval — skipping."
+            exit 0
+          fi
+
+          echo "Auto-approving PR #$PR_NUMBER..."
+          gh pr review "$PR_NUMBER" -R "$REPO" --approve \
+            --body "Auto-approved: Copilot code review passed with zero unresolved issues. All CI checks green." \
+            || echo "::warning::Could not approve PR — the APPROVER_PAT user may be the PR author (self-approval is blocked by GitHub)."
 
       - name: Auto-resolve threads with applied suggestions
         if: steps.dedup.outputs.skip == 'false' && steps.loop-limit.outputs.stop == 'false' && steps.analyze.outputs.has_issues == 'true'
@@ -946,7 +1145,7 @@ jobs:
               'npm run build',
               '```',
               '',
-              `Push fixes directly to branch \`${branchName}\`. Do NOT open a new pull request.`,
+              `Push fixes to branch \`${branchName}\`.`,
               '<!-- copilot-tasks-end -->',
             ].join('\n');
 
@@ -965,9 +1164,12 @@ jobs:
             console.log(`Updated PR #${prNumber} body with ${fixItems.length} pending review tasks.`);
 
             // ──────────────────────────────────────────────────────────
-            // 5. Call @copilot via PR comment to wake the SWE agent
+            // 5. Call @copilot via PR comment AND assignment to wake the SWE agent
             //    CRITICAL: Uses COPILOT_PAT via github-token —
             //    GITHUB_TOKEN mentions are ignored by native bots.
+            //    We use BOTH comment mention AND PR assignment because
+            //    comment mentions alone can be unreliable for triggering
+            //    the Copilot coding agent.
             // ──────────────────────────────────────────────────────────
             const reviewUrl = process.env.REVIEW_URL;
             const commentResult = await github.rest.issues.createComment({
@@ -979,6 +1181,40 @@ jobs:
                 `and push the fixes to this branch.`,
             });
             console.log(`Mentioned @copilot on PR #${prNumber} (comment id: ${commentResult.data.id}, url: ${commentResult.data.html_url})`);
+
+            // ──────────────────────────────────────────────────────────
+            // 6. Assign @copilot to the PR as a belt-and-suspenders trigger
+            //    The assignment is the most reliable way to activate the
+            //    Copilot coding agent. The comment mention above serves
+            //    as a backup and provides context for the agent.
+            // ──────────────────────────────────────────────────────────
+            try {
+              // First remove copilot assignee (in case already assigned from a previous loop)
+              try {
+                await github.rest.issues.removeAssignees({
+                  owner, repo,
+                  issue_number: prNumber,
+                  assignees: ['copilot'],
+                });
+                console.log('Removed previous copilot assignment (if any).');
+              } catch (e) {
+                console.log(`Note: Could not remove copilot assignee: ${e.message}`);
+              }
+
+              // Small delay to ensure the removal is processed before re-assigning
+              await new Promise(resolve => setTimeout(resolve, 3000));
+
+              // Now assign copilot to trigger the SWE agent
+              await github.rest.issues.addAssignees({
+                owner, repo,
+                issue_number: prNumber,
+                assignees: ['copilot'],
+              });
+              console.log(`Assigned @copilot to PR #${prNumber} to trigger SWE agent.`);
+            } catch (assignErr) {
+              console.log(`::warning::Could not assign copilot to PR: ${assignErr.message}`);
+              console.log('The @copilot comment mention should still trigger the agent.');
+            }
 
       - name: Debug — Verify Copilot SWE Agent Activation
         if: steps.dedup.outputs.skip == 'false' && steps.loop-limit.outputs.stop == 'false' && steps.analyze.outputs.has_issues == 'true'
