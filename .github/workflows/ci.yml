@@ -72,7 +72,7 @@ jobs:
       !startsWith(github.ref_name, 'dependabot/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v6
         with:
@@ -95,7 +95,7 @@ jobs:
       !startsWith(github.ref_name, 'dependabot/')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v6
         with:
@@ -117,7 +117,7 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           token: ${{ secrets.COPILOT_PAT || github.token }}
 
@@ -191,7 +191,7 @@ jobs:
           !contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
         run: echo "Skipping — 'ready-to-merge' label not present"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         if: >-
           github.event_name == 'pull_request' &&
           contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
@@ -213,7 +213,7 @@ jobs:
     runs-on: ubuntu-latest
     needs: [lint-and-typecheck, test, security]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
 
       - uses: actions/setup-node@v6
         with:
@@ -252,7 +252,7 @@ jobs:
           !contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
         run: echo "Skipping — 'ready-to-merge' label not present"
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         if: >-
           github.event_name == 'pull_request' &&
           contains(github.event.pull_request.labels.*.name, 'ready-to-merge')
