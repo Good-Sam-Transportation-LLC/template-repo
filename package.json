@@ -97,7 +97,7 @@
     "typescript": "5.8.3",
     "typescript-eslint": "^8.57.2",
     "vite": "8.0.2",
-    "vitest": "^4.1.1",
+    "vitest": "^4.1.2",
     "yaml": "^2.8.3"
   }
 }
